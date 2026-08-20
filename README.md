@@ -15,10 +15,14 @@ If `FEE_RECIPIENT` is absent/zero, read endpoints start but listing quote/submis
 - `GET /health`, `GET /ready`, `GET /api/v1/config`
 - `POST /api/v1/listings/quote`, `POST /api/v1/listings`
 - `GET /api/v1/listings/:orderHash`, `POST /api/v1/listings/:orderHash/revalidate`
+- `POST /api/v1/listings/revalidate-batch`
 - `GET /api/v1/markets/:transistors/:tokenId/listings|fills|summary`
+- `POST /api/v1/markets/:transistors/:tokenId/batch-quote` for strict manual selection or price-ordered budget Sweep
 - `GET /api/v1/accounts/:offerer/listings`
 
 Amounts and chain counters are decimal strings. Submission recomputes the hash, signature signer, exact 1% per-unit fee, recipients, Factory relationship, balance, direct Seaport approval, counter, and order status. `isValidated=false` is recorded as a valid off-chain signature state, not treated as rejection.
+
+Batch quotes are short-lived, deterministic plans for one allowlisted market. Manual selection fails the full plan on any changed order; Sweep skips invalid candidates, includes the 1% buyer fee inside its budget, and may partially fill the final order. The API performs controlled-concurrency batch validation and never signs, builds, or sends the transaction. See [`docs/batch-quote.md`](docs/batch-quote.md).
 
 ## Database and worker
 

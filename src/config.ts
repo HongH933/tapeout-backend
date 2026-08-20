@@ -21,6 +21,8 @@ const envSchema = z.object({
   FACTORY_START_BLOCK: z.coerce.bigint().default(115900000n), SEAPORT_INDEX_START_BLOCK: z.string().default(""),
   CHAIN_CONFIRMATIONS: z.coerce.number().int().nonnegative().default(15), LISTING_REVALIDATION_SECONDS: z.coerce.number().int().positive().default(60),
   LISTING_STALE_SECONDS: z.coerce.number().int().positive().default(120), CORS_ORIGINS: z.string().default("http://localhost:3000"), LOG_LEVEL: z.string().default("info"),
+  BATCH_QUOTE_TTL_SECONDS: z.coerce.number().int().min(5).max(120).default(15), BATCH_MAX_ORDERS: z.coerce.number().int().min(1).max(50).default(20),
+  BATCH_MAX_CANDIDATES: z.coerce.number().int().min(1).max(2_000).default(500), BATCH_REVALIDATION_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(4),
   CHAIN_STARTUP_CHECK: z.string().default("true").transform((v) => v === "true"),
 });
 
@@ -42,7 +44,9 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env) {
     feeRecipient: writeEnabled ? getAddress(env.FEE_RECIPIENT) : null, makerFeeBps: env.MAKER_FEE_BPS, takerFeeBps: env.TAKER_FEE_BPS,
     factoryStartBlock: env.FACTORY_START_BLOCK, seaportIndexStartBlock: env.SEAPORT_INDEX_START_BLOCK ? BigInt(env.SEAPORT_INDEX_START_BLOCK) : null,
     confirmations: env.CHAIN_CONFIRMATIONS, revalidationSeconds: env.LISTING_REVALIDATION_SECONDS, staleSeconds: env.LISTING_STALE_SECONDS,
+    batchQuoteTtlSeconds: env.BATCH_QUOTE_TTL_SECONDS, maxBatchOrders: env.BATCH_MAX_ORDERS,
+    maxBatchCandidates: env.BATCH_MAX_CANDIDATES, batchRevalidationConcurrency: env.BATCH_REVALIDATION_CONCURRENCY,
     corsOrigins: env.CORS_ORIGINS.split(",").map((v) => v.trim()).filter(Boolean), logLevel: env.LOG_LEVEL, chainStartupCheck: env.CHAIN_STARTUP_CHECK,
-    writeEnabled, maxListingDurationSeconds: 30 * 24 * 60 * 60,
+    writeEnabled, batchEnabled: writeEnabled, maxListingDurationSeconds: 30 * 24 * 60 * 60,
   };
 }

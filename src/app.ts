@@ -9,8 +9,9 @@ import type { AppConfig } from "./config.js";
 import type { ListingRepository } from "./db/repository.js";
 import { DomainError } from "./domain/errors.js";
 import { quoteOrder } from "./domain/order-math.js";
-import { revalidateListing, validateAsset, validateSignedListing } from "./chain/validation.js";
-import { accountParamsSchema, hashParamsSchema, marketParamsSchema, quoteSchema, signedListingSchema } from "./api/schemas.js";
+import { assertBatchQuoteExpectation, buildSelectedBatchQuote, buildSweepBatchQuote, type BatchCandidate } from "./domain/batch-quote.js";
+import { inspectListings, revalidateListing, validateAsset, validateSignedListing } from "./chain/validation.js";
+import { accountParamsSchema, batchQuoteSchema, hashParamsSchema, marketParamsSchema, quoteSchema, revalidateBatchSchema, signedListingSchema } from "./api/schemas.js";
 
 export type AppDependencies = { config: AppConfig; repository: ListingRepository; chainClient: PublicClient };
 export async function buildApp({ config, repository, chainClient }: AppDependencies): Promise<FastifyInstance> {
@@ -22,11 +23,12 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof DomainError) return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details ?? null } });
     if ((error as any).name === "ZodError") return reply.status(400).send({ error: { code: "INVALID_REQUEST", message: "Request validation failed", details: (error as any).issues } });
+    if (typeof error === "object" && error !== null && "statusCode" in error && error.statusCode === 429) return reply.status(429).send({ error: { code: "RATE_LIMITED", message: "Rate limit exceeded", details: null } });
     app.log.error(error); return reply.status(500).send({ error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
   });
   app.get("/health", { schema: { tags: ["health"] } }, async () => ({ ok: true }));
   app.get("/ready", { schema: { tags: ["health"] } }, async (_request, reply) => { try { await repository.ready(); return { ready: true, writeEnabled: config.writeEnabled }; } catch { return reply.status(503).send({ ready: false, writeEnabled: false }); } });
-  app.get("/api/v1/config", { schema: { tags: ["config"] } }, async () => ({ chainId: config.chainId, seaportAddress: config.seaportAddress, validatorAddress: config.validatorAddress, factoryAddress: config.factoryAddress, feeRecipient: config.feeRecipient, makerFeeBps: config.makerFeeBps, takerFeeBps: config.takerFeeBps, maxListingDurationSeconds: config.maxListingDurationSeconds, writeEnabled: config.writeEnabled }));
+  app.get("/api/v1/config", { schema: { tags: ["config"] } }, async () => ({ chainId: config.chainId, seaportAddress: config.seaportAddress, validatorAddress: config.validatorAddress, factoryAddress: config.factoryAddress, feeRecipient: config.feeRecipient, makerFeeBps: config.makerFeeBps, takerFeeBps: config.takerFeeBps, maxListingDurationSeconds: config.maxListingDurationSeconds, batchQuoteTtlSeconds: config.batchQuoteTtlSeconds, maxBatchOrders: config.maxBatchOrders, batchEnabled: config.batchEnabled, writeEnabled: config.writeEnabled }));
   app.post("/api/v1/listings/quote", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } }, schema: { tags: ["listings"] } }, async (request) => {
     if (!config.writeEnabled) throw new DomainError("WRITE_API_DISABLED", "FEE_RECIPIENT is not configured", 503);
     const body = quoteSchema.parse(request.body); const now = BigInt(Math.floor(Date.now() / 1000)); const end = BigInt(body.endTime);
@@ -46,7 +48,8 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
   });
   app.get("/api/v1/markets/:transistorsAddress/:tokenId/listings", { schema: { tags: ["markets"] } }, async (request) => {
     const params = marketParamsSchema.parse(request.params); const query = request.query as Record<string, string | undefined>;
-    const listings = await repository.list({ ...params, statuses: ["ACTIVE", "PARTIALLY_FILLED", "STALE"], limit: query.limit ? Number(query.limit) : 50, ...(query.cursor ? { cursor: query.cursor } : {}) });
+    const page = await repository.listMarketPage({ ...params, statuses: ["ACTIVE", "PARTIALLY_FILLED", "STALE"], limit: query.limit ? Number(query.limit) : 50, ...(query.cursor ? { cursor: query.cursor } : {}) });
+    const listings = page.listings;
     const staleBefore = Date.now() - config.staleSeconds * 1_000;
     const refreshed = await Promise.all(listings.map(async (listing) => {
       if (listing.status !== "STALE" && Date.parse(listing.lastValidatedAt) >= staleBefore) return listing;
@@ -55,7 +58,60 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
         return (await repository.updateValidation(listing.orderHash, { status: "STALE", validationState: "RPC_ERROR", validationDetails: { message: error instanceof Error ? error.message : "Unknown RPC error" }, lastValidatedAt: new Date().toISOString(), updatedAt: new Date().toISOString() })) ?? listing;
       }
     }));
-    return { listings: refreshed.filter((listing) => ["ACTIVE", "PARTIALLY_FILLED", "STALE"].includes(listing.status)), nextCursor: null };
+    return { listings: refreshed.filter((listing) => ["ACTIVE", "PARTIALLY_FILLED", "STALE"].includes(listing.status)), nextCursor: page.nextCursor };
+  });
+  app.post("/api/v1/markets/:transistorsAddress/:tokenId/batch-quote", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } }, schema: { tags: ["markets", "batch"] } }, async (request) => {
+    if (!config.batchEnabled) throw new DomainError("WRITE_API_DISABLED", "Batch quotes are disabled", 503);
+    const params = marketParamsSchema.parse(request.params); const body = batchQuoteSchema.parse(request.body);
+    const asOfBlock = (await chainClient.getBlockNumber()).toString();
+    if (body.mode === "SELECTED") {
+      const uniqueHashes = [...new Set(body.items.map((item) => item.orderHash.toLowerCase()))];
+      if (uniqueHashes.length !== body.items.length) throw new DomainError("BATCH_PLAN_CHANGED", "Selected listings contain duplicates", 409);
+      if (body.items.length > config.maxBatchOrders) throw new DomainError("BATCH_TOO_MANY_ORDERS", `A batch supports at most ${config.maxBatchOrders} listings`);
+      const listings = await repository.getMany(uniqueHashes); const byHash = new Map(listings.map((listing) => [listing.orderHash.toLowerCase(), listing]));
+      const preflightIssues = body.items.flatMap((item) => {
+        const listing = byHash.get(item.orderHash.toLowerCase());
+        if (!listing) return [{ orderHash: item.orderHash, issueCode: "LISTING_NOT_FOUND" }];
+        if (listing.transistorsAddress.toLowerCase() !== params.transistorsAddress.toLowerCase() || listing.tokenId !== params.tokenId) return [{ orderHash: item.orderHash, issueCode: "LISTING_NOT_FOUND" }];
+        if (listing.offerer.toLowerCase() === body.buyer.toLowerCase()) return [{ orderHash: item.orderHash, issueCode: "SELF_LISTING" }];
+        return [];
+      });
+      if (preflightIssues.length) throw new DomainError("BATCH_PLAN_CHANGED", "One or more selected listings changed", 409, { issues: preflightIssues });
+      const ordered = body.items.map((item) => byHash.get(item.orderHash.toLowerCase())!);
+      await validateAsset(chainClient, config, ordered[0]!.processorAddress, params.transistorsAddress, params.tokenId);
+      const inspections = await inspectListings(chainClient, config, ordered);
+      await repository.revalidateMany(inspections.map((inspection) => ({ orderHash: inspection.listing.orderHash, patch: inspection.patch })));
+      const issues = inspections.flatMap((inspection) => inspection.issueCode ? [{ orderHash: inspection.listing.orderHash, issueCode: inspection.issueCode }] : []);
+      if (issues.length) throw new DomainError("BATCH_PLAN_CHANGED", "One or more selected listings are no longer fillable", 409, { issues });
+      const candidates: BatchCandidate[] = inspections.map((inspection) => ({ listing: { ...inspection.listing, ...inspection.patch }, sellerBalance: inspection.balance }));
+      const quote = buildSelectedBatchQuote({ chainId: config.chainId, buyer: body.buyer, transistorsAddress: params.transistorsAddress, tokenId: params.tokenId, asOfBlock, ttlSeconds: config.batchQuoteTtlSeconds, maxOrders: config.maxBatchOrders }, candidates, body.items);
+      return assertBatchQuoteExpectation(quote, body.expectedPlanHash, body.quoteExpiresAt);
+    }
+    const maxOrders = body.maxOrders ?? config.maxBatchOrders;
+    if (maxOrders > config.maxBatchOrders) throw new DomainError("BATCH_TOO_MANY_ORDERS", `A batch supports at most ${config.maxBatchOrders} listings`);
+    const listings = await repository.listSweepCandidates({ ...params, excludeOfferer: body.buyer, maxSellerUnitPriceWei: body.maxSellerUnitPriceWei, statuses: ["ACTIVE", "PARTIALLY_FILLED"], limit: config.maxBatchCandidates });
+    if (!listings.length) {
+      const first = await repository.listMarketPage({ ...params, statuses: ["ACTIVE", "PARTIALLY_FILLED"], limit: 1 }); const best = first.listings[0];
+      if (best && BigInt(best.sellerUnitPriceWei) > BigInt(body.maxSellerUnitPriceWei)) throw new DomainError("MAX_PRICE_BELOW_BEST_ASK", "Maximum seller unit price is below the best ask", 409, { bestAskSellerUnitPriceWei: best.sellerUnitPriceWei });
+      throw new DomainError("BATCH_EMPTY", "No fillable listings matched this sweep", 409);
+    }
+    await validateAsset(chainClient, config, listings[0]!.processorAddress, params.transistorsAddress, params.tokenId);
+    const inspections = await inspectListings(chainClient, config, listings);
+    await repository.revalidateMany(inspections.map((inspection) => ({ orderHash: inspection.listing.orderHash, patch: inspection.patch })));
+    const issueCounts = new Map<string, number>();
+    for (const inspection of inspections) if (inspection.issueCode) issueCounts.set(inspection.issueCode, (issueCounts.get(inspection.issueCode) ?? 0) + 1);
+    const warnings = [...issueCounts.entries()].map(([code, count]) => `${code}:${count}`);
+    const candidates: BatchCandidate[] = inspections.filter((inspection) => !inspection.issueCode && inspection.listing.offerer.toLowerCase() !== body.buyer.toLowerCase()).map((inspection) => ({ listing: { ...inspection.listing, ...inspection.patch }, sellerBalance: inspection.balance }));
+    const quote = buildSweepBatchQuote({ chainId: config.chainId, buyer: body.buyer, transistorsAddress: params.transistorsAddress, tokenId: params.tokenId, asOfBlock, ttlSeconds: config.batchQuoteTtlSeconds, maxOrders, warnings }, candidates, BigInt(body.budgetWei), BigInt(body.maxSellerUnitPriceWei));
+    return assertBatchQuoteExpectation(quote, body.expectedPlanHash, body.quoteExpiresAt);
+  });
+  app.post("/api/v1/listings/revalidate-batch", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } }, schema: { tags: ["listings", "batch"] } }, async (request) => {
+    const body = revalidateBatchSchema.parse(request.body); const orderHashes = [...new Set(body.orderHashes.map((hash) => hash.toLowerCase()))];
+    if (orderHashes.length > config.maxBatchOrders) throw new DomainError("BATCH_TOO_MANY_ORDERS", `A batch supports at most ${config.maxBatchOrders} listings`);
+    const listings = await repository.getMany(orderHashes); const found = new Set(listings.map((listing) => listing.orderHash.toLowerCase()));
+    const inspections = await inspectListings(chainClient, config, listings);
+    await repository.revalidateMany(inspections.map((inspection) => ({ orderHash: inspection.listing.orderHash, patch: inspection.patch })));
+    return { results: [...inspections.map((inspection) => ({ orderHash: inspection.listing.orderHash, status: inspection.patch.status, remainingQuantity: inspection.patch.remainingQuantity, balance: inspection.balance, approval: inspection.approval, counter: inspection.counter, orderStatus: inspection.orderStatus, validatorResult: inspection.validatorResult, lastValidatedAt: inspection.patch.lastValidatedAt, issueCode: inspection.issueCode })), ...orderHashes.filter((hash) => !found.has(hash)).map((orderHash) => ({ orderHash, status: null, remainingQuantity: null, balance: null, approval: null, counter: null, orderStatus: null, validatorResult: null, lastValidatedAt: new Date().toISOString(), issueCode: "LISTING_NOT_FOUND" }))] };
   });
   app.get("/api/v1/accounts/:address/listings", { schema: { tags: ["accounts"] } }, async (request) => { const { address } = accountParamsSchema.parse(request.params); return { listings: await repository.list({ offerer: address, limit: 100 }) }; });
   app.get("/api/v1/markets/:transistorsAddress/:tokenId/fills", { schema: { tags: ["markets"] } }, async (request) => { const params = marketParamsSchema.parse(request.params); return { fills: await repository.listFills(params.transistorsAddress, params.tokenId) }; });

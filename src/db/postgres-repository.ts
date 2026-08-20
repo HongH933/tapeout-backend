@@ -1,6 +1,6 @@
 import type pg from "pg";
 import type { ListingRecord } from "../domain/listing.js";
-import type { ListingQuery, ListingRepository } from "./repository.js";
+import { decodeMarketCursor, encodeMarketCursor, type ListingQuery, type ListingRepository, type ListingValidationPatch, type MarketPageQuery, type SweepCandidateQuery } from "./repository.js";
 
 function map(row: any): ListingRecord {
   return {
@@ -18,6 +18,11 @@ export class PostgresListingRepository implements ListingRepository {
   constructor(private readonly pool: pg.Pool) {}
   async ready() { await this.pool.query("SELECT 1"); return true; }
   async get(orderHash: string) { const result = await this.pool.query("SELECT * FROM seaport_listings WHERE order_hash=$1", [orderHash.toLowerCase()]); return result.rows[0] ? map(result.rows[0]) : null; }
+  async getMany(orderHashes: string[]) {
+    if (!orderHashes.length) return [];
+    const result = await this.pool.query("SELECT * FROM seaport_listings WHERE order_hash=ANY($1::text[])", [orderHashes.map((hash) => hash.toLowerCase())]);
+    return result.rows.map(map);
+  }
   async insert(l: ListingRecord) {
     const values = [l.orderHash.toLowerCase(), l.chainId, l.seaportAddress.toLowerCase(), l.offerer.toLowerCase(), l.processorAddress.toLowerCase(), l.transistorsAddress.toLowerCase(), l.tokenId, l.assetType, l.initialQuantity, l.remainingQuantity, l.sellerUnitPriceWei, l.takerFeePerUnitWei, l.buyerUnitTotalWei, l.sellerTotalWei, l.feeTotalWei, l.buyerTotalWei, l.startTime, l.endTime, l.parameters.orderType, l.parameters.zone, l.parameters.zoneHash, l.parameters.conduitKey, l.parameters.counter, l.parameters.salt, JSON.stringify(l.parameters), l.signature, l.status, l.validationState, JSON.stringify(l.validationDetails), JSON.stringify(l.validatorCodes), l.lastValidatedAt];
     const sql = `INSERT INTO seaport_listings (order_hash,chain_id,seaport_address,offerer,processor_address,transistors_address,token_id,asset_type,initial_quantity,remaining_quantity,seller_unit_price_wei,taker_fee_per_unit_wei,buyer_unit_total_wei,seller_total_wei,fee_total_wei,buyer_total_wei,start_time,end_time,order_type,zone,zone_hash,conduit_key,counter,salt,parameters_json,signature,status,validation_state,validation_details_json,validator_codes_json,last_validated_at) VALUES (${values.map((_, i) => `$${i + 1}`).join(",")}) ON CONFLICT (order_hash) DO NOTHING RETURNING *`;
@@ -32,12 +37,32 @@ export class PostgresListingRepository implements ListingRepository {
     const result = await this.pool.query(`SELECT * FROM seaport_listings ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY seller_unit_price_wei ASC, order_hash ASC LIMIT $${values.length}`, values);
     return result.rows.map(map);
   }
-  async updateValidation(orderHash: string, patch: any) {
+  async listMarketPage(q: MarketPageQuery) {
+    const values: unknown[] = [q.transistorsAddress.toLowerCase(), q.tokenId, q.statuses ?? ["ACTIVE", "PARTIALLY_FILLED"]];
+    const clauses = ["transistors_address=$1", "token_id=$2", "status=ANY($3::text[])"];
+    if (q.cursor) {
+      const cursor = decodeMarketCursor(q.cursor); values.push(cursor.sellerUnitPriceWei, cursor.orderHash);
+      clauses.push(`(seller_unit_price_wei>$4 OR (seller_unit_price_wei=$4 AND order_hash>$5))`);
+    }
+    const limit = Math.min(Math.max(q.limit, 1), 100); values.push(limit + 1);
+    const result = await this.pool.query(`SELECT * FROM seaport_listings WHERE ${clauses.join(" AND ")} ORDER BY seller_unit_price_wei ASC,order_hash ASC LIMIT $${values.length}`, values);
+    const rows = result.rows.map(map); const hasMore = rows.length > limit; const listings = rows.slice(0, limit); const last = listings.at(-1);
+    return { listings, nextCursor: hasMore && last ? encodeMarketCursor({ sellerUnitPriceWei: last.sellerUnitPriceWei, orderHash: last.orderHash }) : null };
+  }
+  async listSweepCandidates(q: SweepCandidateQuery) {
+    const limit = Math.min(Math.max(q.limit, 1), 2_000);
+    const result = await this.pool.query("SELECT * FROM seaport_listings WHERE transistors_address=$1 AND token_id=$2 AND offerer<>$3 AND status=ANY($4::text[]) AND seller_unit_price_wei<=$5 AND end_time>extract(epoch from now()) ORDER BY seller_unit_price_wei ASC,order_hash ASC LIMIT $6", [q.transistorsAddress.toLowerCase(), q.tokenId, q.excludeOfferer.toLowerCase(), q.statuses, q.maxSellerUnitPriceWei, limit]);
+    return result.rows.map(map);
+  }
+  async updateValidation(orderHash: string, patch: ListingValidationPatch) {
     const keys: Record<string, string> = { status: "status", remainingQuantity: "remaining_quantity", validationState: "validation_state", validationDetails: "validation_details_json", validatorCodes: "validator_codes_json", lastValidatedAt: "last_validated_at", updatedAt: "updated_at" };
     const entries = Object.entries(patch).filter(([k]) => keys[k]); if (!entries.length) return this.get(orderHash);
     const values = entries.map(([, value]) => typeof value === "object" ? JSON.stringify(value) : value); values.push(orderHash.toLowerCase());
     const result = await this.pool.query(`UPDATE seaport_listings SET ${entries.map(([key], i) => `${keys[key]}=$${i + 1}`).join(",")} WHERE order_hash=$${values.length} RETURNING *`, values);
     return result.rows[0] ? map(result.rows[0]) : null;
+  }
+  async revalidateMany(updates: Array<{ orderHash: string; patch: ListingValidationPatch }>) {
+    return (await Promise.all(updates.map(({ orderHash, patch }) => this.updateValidation(orderHash, patch)))).filter((row): row is ListingRecord => row !== null);
   }
   async listFills(transistorsAddress: string, tokenId: string, limit = 100) {
     const result = await this.pool.query("SELECT * FROM seaport_fills WHERE transistors_address=$1 AND token_id=$2 ORDER BY block_number DESC,log_index DESC LIMIT $3", [transistorsAddress.toLowerCase(), tokenId, Math.min(limit, 200)]);

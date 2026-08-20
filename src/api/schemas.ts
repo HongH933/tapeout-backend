@@ -13,3 +13,16 @@ export const signedListingSchema = z.object({
 export const hashParamsSchema = z.object({ orderHash: bytes32 });
 export const marketParamsSchema = z.object({ transistorsAddress: address, tokenId: z.enum(["0", "1"] ) });
 export const accountParamsSchema = z.object({ address });
+
+const selectedBatchSchema = z.object({
+  mode: z.literal("SELECTED"), buyer: address,
+  items: z.array(z.object({ orderHash: bytes32, quantity: decimal })).min(1),
+  expectedPlanHash: bytes32.optional(), quoteExpiresAt: z.string().datetime().optional(),
+});
+const sweepBatchSchema = z.object({
+  mode: z.literal("SWEEP"), buyer: address, budgetWei: decimal,
+  maxSellerUnitPriceWei: decimal, maxOrders: z.number().int().positive().optional(),
+  expectedPlanHash: bytes32.optional(), quoteExpiresAt: z.string().datetime().optional(),
+});
+export const batchQuoteSchema = z.discriminatedUnion("mode", [selectedBatchSchema, sweepBatchSchema]);
+export const revalidateBatchSchema = z.object({ orderHashes: z.array(bytes32).min(1) });

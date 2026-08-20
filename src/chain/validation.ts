@@ -60,7 +60,18 @@ export async function validateSignedListing(client: PublicClient, config: AppCon
     validatorCodes, startTime: input.parameters.startTime, endTime: input.parameters.endTime, createdAt: timestamp, updatedAt: timestamp, lastValidatedAt: timestamp };
 }
 
-export async function revalidateListing(client: PublicClient, config: AppConfig, listing: ListingRecord) {
+export type ListingInspection = {
+  listing: ListingRecord;
+  patch: Awaited<ReturnType<typeof inspectListingPatch>>["patch"];
+  balance: string;
+  approval: boolean;
+  counter: string;
+  orderStatus: { isValidated: boolean; isCancelled: boolean; totalFilled: string; totalSize: string };
+  validatorResult: { errors: number[]; warnings: number[] };
+  issueCode: string | null;
+};
+
+async function inspectListingPatch(client: PublicClient, config: AppConfig, listing: ListingRecord) {
   const offer = listing.parameters.offer[0]!;
   const [counter, balance, approval, status, validatorCodes] = await Promise.all([
     client.readContract({ address: address(config.seaportAddress), abi: seaportAbi, functionName: "getCounter", args: [address(listing.offerer)] }),
@@ -75,5 +86,43 @@ export async function revalidateListing(client: PublicClient, config: AppConfig,
   else if (totalSize > 0n && totalFilled >= totalSize) next = "FILLED"; else if (balance < BigInt(offer.startAmount) * (totalSize > 0n ? totalSize - totalFilled : 1n) / (totalSize || 1n)) next = "INVALID_BALANCE";
   else if (!approval || validatorCodes.errors.includes(401)) next = "INVALID_APPROVAL"; else if (validatorCodes.errors.includes(402)) next = "INVALID_BALANCE"; else if (validatorCodes.errors.length) next = "STALE"; else if (totalFilled > 0n) next = "PARTIALLY_FILLED";
   const remaining = totalSize === 0n ? BigInt(listing.initialQuantity) : BigInt(listing.initialQuantity) * (totalSize - totalFilled) / totalSize;
-  const timestamp = new Date().toISOString(); return { status: next, remainingQuantity: remaining.toString(), validationState: isValidated ? "ONCHAIN_VALIDATED" : "SIGNED_OFFCHAIN_VALID", validationDetails: { isValidated, totalFilled: totalFilled.toString(), totalSize: totalSize.toString(), canonicalValidator: "PASSED" }, validatorCodes, lastValidatedAt: timestamp, updatedAt: timestamp };
+  const timestamp = new Date().toISOString();
+  const patch = { status: next, remainingQuantity: remaining.toString(), validationState: isValidated ? "ONCHAIN_VALIDATED" : "SIGNED_OFFCHAIN_VALID", validationDetails: { isValidated, totalFilled: totalFilled.toString(), totalSize: totalSize.toString(), canonicalValidator: "PASSED", balance: balance.toString(), approval, counter: counter.toString() }, validatorCodes, lastValidatedAt: timestamp, updatedAt: timestamp } as const;
+  return { patch, balance, approval, counter, isValidated, isCancelled, totalFilled, totalSize, validatorCodes };
+}
+
+function issueForStatus(status: ListingRecord["status"]) {
+  if (status === "INVALID_BALANCE") return "INSUFFICIENT_SELLER_BALANCE";
+  if (status === "INVALID_APPROVAL") return "INVALID_SELLER_APPROVAL";
+  if (status === "CANCELLED") return "ORDER_CANCELLED";
+  if (status === "FILLED") return "ORDER_FILLED";
+  if (status === "EXPIRED") return "ORDER_EXPIRED";
+  if (status === "ACTIVE" || status === "PARTIALLY_FILLED") return null;
+  return "LISTING_NOT_FILLABLE";
+}
+
+export async function inspectListing(client: PublicClient, config: AppConfig, listing: ListingRecord): Promise<ListingInspection> {
+  const result = await inspectListingPatch(client, config, listing);
+  return {
+    listing,
+    patch: result.patch,
+    balance: result.balance.toString(),
+    approval: result.approval,
+    counter: result.counter.toString(),
+    orderStatus: { isValidated: result.isValidated, isCancelled: result.isCancelled, totalFilled: result.totalFilled.toString(), totalSize: result.totalSize.toString() },
+    validatorResult: result.validatorCodes,
+    issueCode: issueForStatus(result.patch.status),
+  };
+}
+
+export async function inspectListings(client: PublicClient, config: AppConfig, listings: ListingRecord[], concurrency = config.batchRevalidationConcurrency) {
+  const results: ListingInspection[] = [];
+  for (let index = 0; index < listings.length; index += concurrency) {
+    results.push(...await Promise.all(listings.slice(index, index + concurrency).map((listing) => inspectListing(client, config, listing))));
+  }
+  return results;
+}
+
+export async function revalidateListing(client: PublicClient, config: AppConfig, listing: ListingRecord) {
+  return (await inspectListing(client, config, listing)).patch;
 }
