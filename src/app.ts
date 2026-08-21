@@ -8,10 +8,11 @@ import type { PublicClient } from "viem";
 import type { AppConfig } from "./config.js";
 import type { ListingRepository } from "./db/repository.js";
 import { DomainError } from "./domain/errors.js";
+import { assertListingCapacity } from "./domain/listing-capacity.js";
 import { quoteOrder } from "./domain/order-math.js";
 import { assertBatchQuoteExpectation, buildSelectedBatchQuote, buildSweepBatchQuote, type BatchCandidate } from "./domain/batch-quote.js";
-import { inspectListings, revalidateListing, validateAsset, validateSignedListing } from "./chain/validation.js";
-import { accountParamsSchema, batchQuoteSchema, hashParamsSchema, marketParamsSchema, quoteSchema, revalidateBatchSchema, signedListingSchema } from "./api/schemas.js";
+import { inspectListings, readListingWalletBalance, resolveAndValidateAsset, revalidateListing, validateAsset, validateSignedListing } from "./chain/validation.js";
+import { accountParamsSchema, batchQuoteSchema, hashParamsSchema, listingCapacityParamsSchema, marketParamsSchema, marketSummariesSchema, quoteSchema, revalidateBatchSchema, signedListingSchema } from "./api/schemas.js";
 
 export type AppDependencies = { config: AppConfig; repository: ListingRepository; chainClient: PublicClient };
 export async function buildApp({ config, repository, chainClient }: AppDependencies): Promise<FastifyInstance> {
@@ -20,11 +21,18 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
   await app.register(swagger, { openapi: { info: { title: "TapeMarket Seaport Orderbook API", version: "1.0.0" }, servers: [{ url: "/" }] } });
   await app.register(swaggerUi, { routePrefix: "/docs" });
-  app.setErrorHandler((error, _request, reply) => {
-    if (error instanceof DomainError) return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details ?? null } });
-    if ((error as any).name === "ZodError") return reply.status(400).send({ error: { code: "INVALID_REQUEST", message: "Request validation failed", details: (error as any).issues } });
-    if (typeof error === "object" && error !== null && "statusCode" in error && error.statusCode === 429) return reply.status(429).send({ error: { code: "RATE_LIMITED", message: "Rate limit exceeded", details: null } });
-    app.log.error(error); return reply.status(500).send({ error: { code: "INTERNAL_ERROR", message: "Internal server error" } });
+  app.setErrorHandler((error, request, reply) => {
+    const body = request.body as { orderHash?: unknown; offerer?: unknown; parameters?: { offerer?: unknown } } | undefined;
+    const offerer = typeof body?.parameters?.offerer === "string" ? body.parameters.offerer : typeof body?.offerer === "string" ? body.offerer : undefined;
+    const orderHash = typeof body?.orderHash === "string" ? body.orderHash : undefined;
+    if (error instanceof DomainError) {
+      request.log.warn({ requestId: request.id, offerer, orderHash, errorCode: error.code, validatorCodes: error.code === "VALIDATOR_REJECTED" ? error.details : undefined }, error.message);
+      return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details ?? null, requestId: request.id } });
+    }
+    if ((error as any).name === "ZodError") return reply.status(400).send({ error: { code: "INVALID_REQUEST", message: "Request validation failed", details: (error as any).issues, requestId: request.id } });
+    if (typeof error === "object" && error !== null && "statusCode" in error && error.statusCode === 429) return reply.status(429).send({ error: { code: "RATE_LIMITED", message: "Rate limit exceeded", details: null, requestId: request.id } });
+    request.log.error({ err: error, requestId: request.id, offerer, orderHash, errorCode: "INTERNAL_ERROR" });
+    return reply.status(500).send({ error: { code: "INTERNAL_ERROR", message: "Internal server error", details: null, requestId: request.id } });
   });
   app.get("/health", { schema: { tags: ["health"] } }, async () => ({ ok: true }));
   app.get("/ready", { schema: { tags: ["health"] } }, async (_request, reply) => { try { await repository.ready(); return { ready: true, writeEnabled: config.writeEnabled }; } catch { return reply.status(503).send({ ready: false, writeEnabled: false }); } });
@@ -34,12 +42,18 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
     const body = quoteSchema.parse(request.body); const now = BigInt(Math.floor(Date.now() / 1000)); const end = BigInt(body.endTime);
     if (end <= now || end - now > BigInt(config.maxListingDurationSeconds)) throw new DomainError("ORDER_EXPIRED", "End time must be within the next 30 days");
     await validateAsset(chainClient, config, body.processorAddress, body.transistorsAddress, body.tokenId);
-    return { ...body, ...quoteOrder(body.sellerUnitPriceWei, body.quantity, BigInt(config.takerFeeBps)), feeRecipient: config.feeRecipient, makerFeeBps: String(config.makerFeeBps), takerFeeBps: String(config.takerFeeBps) };
+    if (body.offerer) {
+      const walletBalance = await readListingWalletBalance(chainClient, body.offerer, body.transistorsAddress, body.tokenId);
+      const capacity = await repository.getListingCapacity({ offerer: body.offerer, transistorsAddress: body.transistorsAddress, tokenId: body.tokenId, walletBalance, nowSeconds: now.toString() });
+      assertListingCapacity(capacity, body.quantity, body.tokenId === "0" ? "NAND" : "LATCH");
+    }
+    return { processorAddress: body.processorAddress, transistorsAddress: body.transistorsAddress, tokenId: body.tokenId, endTime: body.endTime, ...quoteOrder(body.sellerUnitPriceWei, body.quantity, BigInt(config.takerFeeBps)), feeRecipient: config.feeRecipient, makerFeeBps: String(config.makerFeeBps), takerFeeBps: String(config.takerFeeBps) };
   });
   app.post("/api/v1/listings", { config: { rateLimit: { max: 10, timeWindow: "1 minute", keyGenerator(request) { const offerer = (request.body as { parameters?: { offerer?: unknown } } | undefined)?.parameters?.offerer; return typeof offerer === "string" ? offerer.toLowerCase() : request.ip; } } }, schema: { tags: ["listings"] } }, async (request, reply) => {
     const body = signedListingSchema.parse(request.body); const hash = body.orderHash?.toLowerCase(); if (hash) { const existing = await repository.get(hash); if (existing) return existing; }
     const listing = await validateSignedListing(chainClient, config, { processorAddress: body.processorAddress, parameters: body.parameters, signature: body.signature, ...(body.orderHash ? { orderHash: body.orderHash } : {}) }); const existing = await repository.get(listing.orderHash); if (existing) return existing;
-    return reply.status(201).send(await repository.insert(listing));
+    const walletBalance = await readListingWalletBalance(chainClient, listing.offerer, listing.transistorsAddress, listing.tokenId);
+    return reply.status(201).send(await repository.insertWithCapacityCheck({ listing, walletBalance, nowSeconds: String(Math.floor(Date.now() / 1_000)) }));
   });
   app.get("/api/v1/listings/:orderHash", { schema: { tags: ["listings"] } }, async (request) => { const { orderHash } = hashParamsSchema.parse(request.params); const result = await repository.get(orderHash); if (!result) throw new DomainError("NOT_FOUND", "Listing not found", 404); return result; });
   app.post("/api/v1/listings/:orderHash/revalidate", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } }, schema: { tags: ["listings"] } }, async (request) => {
@@ -114,8 +128,25 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
     return { results: [...inspections.map((inspection) => ({ orderHash: inspection.listing.orderHash, status: inspection.patch.status, remainingQuantity: inspection.patch.remainingQuantity, balance: inspection.balance, approval: inspection.approval, counter: inspection.counter, orderStatus: inspection.orderStatus, validatorResult: inspection.validatorResult, lastValidatedAt: inspection.patch.lastValidatedAt, issueCode: inspection.issueCode })), ...orderHashes.filter((hash) => !found.has(hash)).map((orderHash) => ({ orderHash, status: null, remainingQuantity: null, balance: null, approval: null, counter: null, orderStatus: null, validatorResult: null, lastValidatedAt: new Date().toISOString(), issueCode: "LISTING_NOT_FOUND" }))] };
   });
   app.get("/api/v1/accounts/:address/listings", { schema: { tags: ["accounts"] } }, async (request) => { const { address } = accountParamsSchema.parse(request.params); return { listings: await repository.list({ offerer: address, limit: 100 }) }; });
+  app.get("/api/v1/accounts/:address/markets/:transistorsAddress/:tokenId/listing-capacity", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } }, schema: { tags: ["accounts", "markets"] } }, async (request) => {
+    const params = listingCapacityParamsSchema.parse(request.params);
+    await resolveAndValidateAsset(chainClient, config, params.transistorsAddress, params.tokenId);
+    const [walletBalance, asOfBlock] = await Promise.all([
+      readListingWalletBalance(chainClient, params.address, params.transistorsAddress, params.tokenId),
+      chainClient.getBlockNumber().then(String),
+    ]);
+    const capacity = await repository.getListingCapacity({ offerer: params.address, transistorsAddress: params.transistorsAddress, tokenId: params.tokenId, walletBalance });
+    return { address: params.address, transistorsAddress: params.transistorsAddress, tokenId: params.tokenId, assetType: params.tokenId === "0" ? "NAND" : "LATCH", ...capacity, asOfBlock, generatedAt: new Date().toISOString() };
+  });
   app.get("/api/v1/markets/:transistorsAddress/:tokenId/fills", { schema: { tags: ["markets"] } }, async (request) => { const params = marketParamsSchema.parse(request.params); return { fills: await repository.listFills(params.transistorsAddress, params.tokenId) }; });
-  app.get("/api/v1/markets/:transistorsAddress/:tokenId/summary", { schema: { tags: ["markets"] } }, async (request) => { const params = marketParamsSchema.parse(request.params); return repository.summary(params.transistorsAddress, params.tokenId); });
+  app.get("/api/v1/markets/:transistorsAddress/:tokenId/summary", { schema: { tags: ["markets"] } }, async (request) => { const params = marketParamsSchema.parse(request.params); return { ...await repository.summary(params.transistorsAddress, params.tokenId), generatedAt: new Date().toISOString() }; });
+  app.post("/api/v1/markets/summaries", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } }, schema: { tags: ["markets"] } }, async (request) => {
+    const body = marketSummariesSchema.parse(request.body);
+    const seen = new Set<string>();
+    const markets = body.markets.filter((market) => { const key = `${market.transistorsAddress.toLowerCase()}:${market.tokenId}`; if (seen.has(key)) return false; seen.add(key); return true; });
+    await Promise.all(markets.map((market) => resolveAndValidateAsset(chainClient, config, market.transistorsAddress, market.tokenId)));
+    return repository.summaries(markets);
+  });
   app.addHook("onClose", async () => repository.close());
   return app;
 }

@@ -6,6 +6,13 @@ export type MarketPageQuery = { transistorsAddress: string; tokenId: string; sta
 export type MarketPage = { listings: ListingRecord[]; nextCursor: string | null };
 export type SweepCandidateQuery = { transistorsAddress: string; tokenId: string; excludeOfferer: string; maxSellerUnitPriceWei: string; statuses: ListingStatus[]; limit: number };
 export type MarketCursor = { sellerUnitPriceWei: string; orderHash: string };
+export type ListingCapacityKey = { offerer: string; transistorsAddress: string; tokenId: string; nowSeconds?: string };
+export type ListingCapacity = {
+  walletBalance: string; reservedListingQuantity: string; availableToList: string;
+  overcommittedQuantity: string; reservingListingCount: number;
+};
+export type InsertWithCapacityCheckInput = { listing: ListingRecord; walletBalance: string; nowSeconds?: string };
+export type MarketIdentity = { transistorsAddress: string; tokenId: string };
 
 export function encodeMarketCursor(cursor: MarketCursor) {
   return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
@@ -23,11 +30,20 @@ export function decodeMarketCursor(value: string): MarketCursor {
   }
 }
 export type FillRecord = { orderHash: string; txHash: string; logIndex: number; blockNumber: string; blockTimestamp: string; seller: string; buyer: string; transistorsAddress: string; tokenId: string; quantity: string; sellerUnitPriceWei: string; sellerProceedsWei: string; takerFeeWei: string; buyerTotalWei: string; source: "SEAPORT_LISTING_SALE" };
-export type MarketSummary = { bestAskWei: string | null; bestAskBuyerTotalWei: string | null; activeListingCount: string; activeListingQuantity: string; lastSeaportSaleWei: string | null; seaportVolume24hWei: string; generatedAt: string };
+export type MarketSummary = {
+  transistorsAddress: string; tokenId: string; bestAskWei: string | null; bestAskBuyerTotalWei: string | null;
+  activeListingCount: string; activeListingQuantity: string; lastSeaportSaleWei: string | null;
+  lastSeaportSaleAt: string | null; lastSeaportSaleTxHash: string | null;
+  seaportVolume24hWei: string; seaportVolumeAllTimeWei: string; seaportFillCount24h: string;
+};
+export type MarketSummaries = { summaries: MarketSummary[]; generatedAt: string; lastIndexedBlock: string | null; indexerStale: boolean };
 export interface ListingRepository {
   ready(): Promise<boolean>; get(orderHash: string): Promise<ListingRecord | null>; getMany(orderHashes: string[]): Promise<ListingRecord[]>; insert(listing: ListingRecord): Promise<ListingRecord>;
+  getReservedListingQuantity(input: ListingCapacityKey): Promise<string>; getListingCapacity(input: ListingCapacityKey & { walletBalance: string }): Promise<ListingCapacity>;
+  insertWithCapacityCheck(input: InsertWithCapacityCheckInput): Promise<ListingRecord>;
   list(query: ListingQuery): Promise<ListingRecord[]>; listMarketPage(query: MarketPageQuery): Promise<MarketPage>; listSweepCandidates(query: SweepCandidateQuery): Promise<ListingRecord[]>;
   updateValidation(orderHash: string, patch: ListingValidationPatch): Promise<ListingRecord | null>; revalidateMany(updates: Array<{ orderHash: string; patch: ListingValidationPatch }>): Promise<ListingRecord[]>;
   listFills(transistorsAddress: string, tokenId: string, limit?: number): Promise<FillRecord[]>; summary(transistorsAddress: string, tokenId: string): Promise<MarketSummary>;
+  summaries(markets: MarketIdentity[]): Promise<MarketSummaries>;
   close(): Promise<void>;
 }

@@ -14,19 +14,27 @@ If `FEE_RECIPIENT` is absent/zero, read endpoints start but listing quote/submis
 
 - `GET /health`, `GET /ready`, `GET /api/v1/config`
 - `POST /api/v1/listings/quote`, `POST /api/v1/listings`
+- `GET /api/v1/accounts/:offerer/markets/:transistors/:tokenId/listing-capacity`
 - `GET /api/v1/listings/:orderHash`, `POST /api/v1/listings/:orderHash/revalidate`
 - `POST /api/v1/listings/revalidate-batch`
 - `GET /api/v1/markets/:transistors/:tokenId/listings|fills|summary`
+- `POST /api/v1/markets/summaries` for up to 50 deduplicated market summaries
 - `POST /api/v1/markets/:transistors/:tokenId/batch-quote` for strict manual selection or price-ordered budget Sweep
 - `GET /api/v1/accounts/:offerer/listings`
 
 Amounts and chain counters are decimal strings. Submission recomputes the hash, signature signer, exact 1% per-unit fee, recipients, Factory relationship, balance, direct Seaport approval, counter, and order status. `isValidated=false` is recorded as a valid off-chain signature state, not treated as rejection.
+
+Seaport does not lock ERC-1155 assets. Listing capacity is a TapeMarket-only soft reservation: current wallet `balanceOf` minus unexpired remaining quantity in `PENDING_VALIDATION`, `ACTIVE`, `PARTIALLY_FILLED`, `STALE`, `INVALID_BALANCE`, and `INVALID_APPROVAL`. Other marketplaces and unpublished signatures are outside this calculation. Quote checks capacity when `offerer` is supplied; publication always rechecks it. Publication uses a PostgreSQL advisory transaction lock keyed by seller/Transistors/token ID, recomputes the SQL aggregate inside the transaction, and preserves duplicate-order idempotency.
+
+Errors return structured `code`, `message`, `details`, and `requestId`. Logs include request ID, offerer, order hash, error code, and validator codes where relevant, while signature and complete parameters stay redacted.
 
 Batch quotes are short-lived, deterministic plans for one allowlisted market. Manual selection fails the full plan on any changed order; Sweep skips invalid candidates, includes the 1% buyer fee inside its budget, and may partially fill the final order. The API performs controlled-concurrency batch validation and never signs, builds, or sends the transaction. See [`docs/batch-quote.md`](docs/batch-quote.md).
 
 ## Database and worker
 
 `migrations/0001_initial.sql` creates processors, assets, listings, fills, and resumable checkpoints. The worker scans `CPUCreated` and confirmed Seaport fulfillment/cancellation logs in bounded ranges, writes idempotently, and revalidates active/recoverable listings every configured interval. Run migrations before API/worker rollouts and back up PostgreSQL with scheduled encrypted RDS snapshots or `pg_dump`; rehearse restores.
+
+Batch summaries read only existing listings, fills, and checkpoints. 24h and indexed volume sum `seller_proceeds_wei`; `buyer_total_wei` is intentionally excluded so the 1% taker fee never inflates trade volume. This capacity/summary release adds no table, column, destructive migration, or rewrite of existing order hashes/signatures.
 
 ## Docker and AWS
 

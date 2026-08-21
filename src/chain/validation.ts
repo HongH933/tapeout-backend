@@ -29,6 +29,16 @@ export async function validateAsset(client: PublicClient, config: AppConfig, pro
   if (!isCpu || linkedTransistors.toLowerCase() !== transistorsAddress.toLowerCase() || linkedProcessor.toLowerCase() !== processorAddress.toLowerCase() || !erc1155) throw new DomainError("INVALID_ASSET", "Factory, Processor and Transistors relationship is invalid");
 }
 
+export async function resolveAndValidateAsset(client: PublicClient, config: AppConfig, transistorsAddress: string, tokenId: string) {
+  const processorAddress = await client.readContract({ address: address(transistorsAddress), abi: transistorsAbi, functionName: "circuits" });
+  await validateAsset(client, config, processorAddress, transistorsAddress, tokenId);
+  return processorAddress;
+}
+
+export async function readListingWalletBalance(client: PublicClient, offerer: string, transistorsAddress: string, tokenId: string) {
+  return (await client.readContract({ address: address(transistorsAddress), abi: transistorsAbi, functionName: "balanceOf", args: [address(offerer), BigInt(tokenId)] })).toString();
+}
+
 export async function validateSignedListing(client: PublicClient, config: AppConfig, input: SignedListingInput): Promise<ListingRecord> {
   if (!config.feeRecipient) throw new DomainError("WRITE_API_DISABLED", "FEE_RECIPIENT is not configured", 503);
   const offer = input.parameters.offer[0]; if (!offer) throw new DomainError("INVALID_STRUCTURE", "Missing offer");

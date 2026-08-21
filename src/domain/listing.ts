@@ -1,5 +1,6 @@
 export const LISTING_STATUSES = ["PENDING_VALIDATION", "ACTIVE", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "EXPIRED", "INVALID_BALANCE", "INVALID_APPROVAL", "INVALID_COUNTER", "INVALID_SIGNATURE", "INVALID_STRUCTURE", "INVALID_ASSET", "STALE", "REJECTED"] as const;
 export type ListingStatus = typeof LISTING_STATUSES[number];
+export const RESERVING_LISTING_STATUSES = ["PENDING_VALIDATION", "ACTIVE", "PARTIALLY_FILLED", "STALE", "INVALID_BALANCE", "INVALID_APPROVAL"] as const satisfies readonly ListingStatus[];
 
 export type OfferItem = { itemType: number; token: string; identifierOrCriteria: string; startAmount: string; endAmount: string };
 export type ConsiderationItem = OfferItem & { recipient: string };

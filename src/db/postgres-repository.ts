@@ -1,6 +1,8 @@
 import type pg from "pg";
 import type { ListingRecord } from "../domain/listing.js";
-import { decodeMarketCursor, encodeMarketCursor, type ListingQuery, type ListingRepository, type ListingValidationPatch, type MarketPageQuery, type SweepCandidateQuery } from "./repository.js";
+import { RESERVING_LISTING_STATUSES } from "../domain/listing.js";
+import { assertListingCapacity, calculateListingCapacity } from "../domain/listing-capacity.js";
+import { decodeMarketCursor, encodeMarketCursor, type InsertWithCapacityCheckInput, type ListingCapacityKey, type ListingQuery, type ListingRepository, type ListingValidationPatch, type MarketIdentity, type MarketPageQuery, type SweepCandidateQuery } from "./repository.js";
 
 function map(row: any): ListingRecord {
   return {
@@ -23,10 +25,46 @@ export class PostgresListingRepository implements ListingRepository {
     const result = await this.pool.query("SELECT * FROM seaport_listings WHERE order_hash=ANY($1::text[])", [orderHashes.map((hash) => hash.toLowerCase())]);
     return result.rows.map(map);
   }
-  async insert(l: ListingRecord) {
+  private async insertUsing(executor: Pick<pg.Pool, "query"> | pg.PoolClient, l: ListingRecord) {
     const values = [l.orderHash.toLowerCase(), l.chainId, l.seaportAddress.toLowerCase(), l.offerer.toLowerCase(), l.processorAddress.toLowerCase(), l.transistorsAddress.toLowerCase(), l.tokenId, l.assetType, l.initialQuantity, l.remainingQuantity, l.sellerUnitPriceWei, l.takerFeePerUnitWei, l.buyerUnitTotalWei, l.sellerTotalWei, l.feeTotalWei, l.buyerTotalWei, l.startTime, l.endTime, l.parameters.orderType, l.parameters.zone, l.parameters.zoneHash, l.parameters.conduitKey, l.parameters.counter, l.parameters.salt, JSON.stringify(l.parameters), l.signature, l.status, l.validationState, JSON.stringify(l.validationDetails), JSON.stringify(l.validatorCodes), l.lastValidatedAt];
     const sql = `INSERT INTO seaport_listings (order_hash,chain_id,seaport_address,offerer,processor_address,transistors_address,token_id,asset_type,initial_quantity,remaining_quantity,seller_unit_price_wei,taker_fee_per_unit_wei,buyer_unit_total_wei,seller_total_wei,fee_total_wei,buyer_total_wei,start_time,end_time,order_type,zone,zone_hash,conduit_key,counter,salt,parameters_json,signature,status,validation_state,validation_details_json,validator_codes_json,last_validated_at) VALUES (${values.map((_, i) => `$${i + 1}`).join(",")}) ON CONFLICT (order_hash) DO NOTHING RETURNING *`;
-    const result = await this.pool.query(sql, values); return result.rows[0] ? map(result.rows[0]) : (await this.get(l.orderHash))!;
+    const result = await executor.query(sql, values);
+    if (result.rows[0]) return map(result.rows[0]);
+    const existing = await executor.query("SELECT * FROM seaport_listings WHERE order_hash=$1", [l.orderHash.toLowerCase()]);
+    return map(existing.rows[0]);
+  }
+  async insert(l: ListingRecord) { return this.insertUsing(this.pool, l); }
+  private async capacityAggregate(executor: Pick<pg.Pool, "query"> | pg.PoolClient, input: ListingCapacityKey) {
+    const nowSeconds = input.nowSeconds ?? String(Math.floor(Date.now() / 1_000));
+    const result = await executor.query(
+      "SELECT coalesce(sum(remaining_quantity),0) reserved_quantity,count(*) reserving_count FROM seaport_listings WHERE offerer=$1 AND transistors_address=$2 AND token_id=$3 AND end_time>$4 AND status=ANY($5::text[])",
+      [input.offerer.toLowerCase(), input.transistorsAddress.toLowerCase(), input.tokenId, nowSeconds, [...RESERVING_LISTING_STATUSES]],
+    );
+    return { reservedListingQuantity: String(result.rows[0]?.reserved_quantity ?? "0"), reservingListingCount: Number(result.rows[0]?.reserving_count ?? 0) };
+  }
+  async getReservedListingQuantity(input: ListingCapacityKey) { return (await this.capacityAggregate(this.pool, input)).reservedListingQuantity; }
+  async getListingCapacity(input: ListingCapacityKey & { walletBalance: string }) {
+    const aggregate = await this.capacityAggregate(this.pool, input);
+    return calculateListingCapacity(input.walletBalance, aggregate.reservedListingQuantity, aggregate.reservingListingCount);
+  }
+  async insertWithCapacityCheck({ listing, walletBalance, nowSeconds }: InsertWithCapacityCheckInput) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const lockIdentity = `${listing.offerer.toLowerCase()}:${listing.transistorsAddress.toLowerCase()}:${listing.tokenId}`;
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [lockIdentity]);
+      const existing = await client.query("SELECT * FROM seaport_listings WHERE order_hash=$1", [listing.orderHash.toLowerCase()]);
+      if (existing.rows[0]) { await client.query("COMMIT"); return map(existing.rows[0]); }
+      const aggregate = await this.capacityAggregate(client, { offerer: listing.offerer, transistorsAddress: listing.transistorsAddress, tokenId: listing.tokenId, ...(nowSeconds ? { nowSeconds } : {}) });
+      const capacity = calculateListingCapacity(walletBalance, aggregate.reservedListingQuantity, aggregate.reservingListingCount);
+      assertListingCapacity(capacity, listing.initialQuantity, listing.assetType);
+      const inserted = await this.insertUsing(client, listing);
+      await client.query("COMMIT");
+      return inserted;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally { client.release(); }
   }
   async list(q: ListingQuery) {
     const clauses: string[] = []; const values: unknown[] = [];
@@ -68,11 +106,46 @@ export class PostgresListingRepository implements ListingRepository {
     const result = await this.pool.query("SELECT * FROM seaport_fills WHERE transistors_address=$1 AND token_id=$2 ORDER BY block_number DESC,log_index DESC LIMIT $3", [transistorsAddress.toLowerCase(), tokenId, Math.min(limit, 200)]);
     return result.rows.map((row) => ({ orderHash: row.order_hash, txHash: row.tx_hash, logIndex: row.log_index, blockNumber: String(row.block_number), blockTimestamp: new Date(row.block_timestamp).toISOString(), seller: row.seller, buyer: row.buyer, transistorsAddress: row.transistors_address, tokenId: String(row.token_id), quantity: String(row.quantity), sellerUnitPriceWei: String(row.seller_unit_price_wei), sellerProceedsWei: String(row.seller_proceeds_wei), takerFeeWei: String(row.taker_fee_wei), buyerTotalWei: String(row.buyer_total_wei), source: "SEAPORT_LISTING_SALE" as const }));
   }
-  async summary(transistorsAddress: string, tokenId: string) {
-    const [listing, fills] = await Promise.all([
-      this.pool.query("SELECT min(seller_unit_price_wei) best_ask,min(buyer_unit_total_wei) best_total,count(*) active_count,coalesce(sum(remaining_quantity),0) active_quantity FROM seaport_listings WHERE transistors_address=$1 AND token_id=$2 AND status IN ('ACTIVE','PARTIALLY_FILLED')", [transistorsAddress.toLowerCase(), tokenId]),
-      this.pool.query("SELECT (array_agg(seller_unit_price_wei ORDER BY block_number DESC,log_index DESC))[1] last_sale,coalesce(sum(CASE WHEN block_timestamp>=now()-interval '24 hours' THEN seller_proceeds_wei ELSE 0 END),0) volume_24h FROM seaport_fills WHERE transistors_address=$1 AND token_id=$2", [transistorsAddress.toLowerCase(), tokenId]),
-    ]); const l = listing.rows[0]; const f = fills.rows[0]; return { bestAskWei: l.best_ask ? String(l.best_ask) : null, bestAskBuyerTotalWei: l.best_total ? String(l.best_total) : null, activeListingCount: String(l.active_count), activeListingQuantity: String(l.active_quantity), lastSeaportSaleWei: f.last_sale ? String(f.last_sale) : null, seaportVolume24hWei: String(f.volume_24h), generatedAt: new Date().toISOString() };
+  async summaries(markets: MarketIdentity[]) {
+    if (!markets.length) return { summaries: [], generatedAt: new Date().toISOString(), lastIndexedBlock: null, indexerStale: true };
+    const result = await this.pool.query(`WITH requested AS (
+      SELECT lower(transistors_address) transistors_address,token_id::numeric token_id
+      FROM unnest($1::text[],$2::text[]) AS requested(transistors_address,token_id)
+    ), checkpoint AS (
+      SELECT block_number,updated_at FROM sync_checkpoints WHERE stream='seaport'
+    )
+    SELECT requested.transistors_address,requested.token_id,
+      listings.best_ask,listings.best_total,coalesce(listings.active_count,0) active_count,coalesce(listings.active_quantity,0) active_quantity,
+      fills.last_sale,fills.last_sale_at,fills.last_sale_tx,coalesce(fills.volume_24h,0) volume_24h,coalesce(fills.volume_all_time,0) volume_all_time,coalesce(fills.fill_count_24h,0) fill_count_24h,
+      checkpoint.block_number checkpoint_block,checkpoint.updated_at checkpoint_updated_at
+    FROM requested
+    LEFT JOIN LATERAL (
+      SELECT (array_agg(seller_unit_price_wei ORDER BY seller_unit_price_wei ASC,order_hash ASC))[1] best_ask,
+        (array_agg(buyer_unit_total_wei ORDER BY seller_unit_price_wei ASC,order_hash ASC))[1] best_total,
+        count(*) active_count,coalesce(sum(remaining_quantity),0) active_quantity
+      FROM seaport_listings WHERE transistors_address=requested.transistors_address AND token_id=requested.token_id
+        AND status IN ('ACTIVE','PARTIALLY_FILLED') AND end_time>extract(epoch from now())
+    ) listings ON true
+    LEFT JOIN LATERAL (
+      SELECT (array_agg(seller_unit_price_wei ORDER BY block_number DESC,log_index DESC))[1] last_sale,
+        (array_agg(block_timestamp ORDER BY block_number DESC,log_index DESC))[1] last_sale_at,
+        (array_agg(tx_hash ORDER BY block_number DESC,log_index DESC))[1] last_sale_tx,
+        coalesce(sum(seller_proceeds_wei) FILTER (WHERE block_timestamp>=now()-interval '24 hours'),0) volume_24h,
+        coalesce(sum(seller_proceeds_wei),0) volume_all_time,
+        count(*) FILTER (WHERE block_timestamp>=now()-interval '24 hours') fill_count_24h
+      FROM seaport_fills WHERE transistors_address=requested.transistors_address AND token_id=requested.token_id
+    ) fills ON true
+    LEFT JOIN checkpoint ON true`, [markets.map((market) => market.transistorsAddress.toLowerCase()), markets.map((market) => market.tokenId)]);
+    const generatedAt = new Date().toISOString();
+    const summaries = result.rows.map((row) => ({
+      transistorsAddress: row.transistors_address, tokenId: String(row.token_id), bestAskWei: row.best_ask ? String(row.best_ask) : null,
+      bestAskBuyerTotalWei: row.best_total ? String(row.best_total) : null, activeListingCount: String(row.active_count), activeListingQuantity: String(row.active_quantity),
+      lastSeaportSaleWei: row.last_sale ? String(row.last_sale) : null, lastSeaportSaleAt: row.last_sale_at ? new Date(row.last_sale_at).toISOString() : null,
+      lastSeaportSaleTxHash: row.last_sale_tx ?? null, seaportVolume24hWei: String(row.volume_24h), seaportVolumeAllTimeWei: String(row.volume_all_time), seaportFillCount24h: String(row.fill_count_24h),
+    }));
+    const checkpoint = result.rows[0];
+    return { summaries, generatedAt, lastIndexedBlock: checkpoint?.checkpoint_block ? String(checkpoint.checkpoint_block) : null, indexerStale: !checkpoint?.checkpoint_updated_at || Date.now() - Date.parse(checkpoint.checkpoint_updated_at) > 5 * 60_000 };
   }
+  async summary(transistorsAddress: string, tokenId: string) { return (await this.summaries([{ transistorsAddress, tokenId }])).summaries[0]!; }
   async close() { await this.pool.end(); }
 }
