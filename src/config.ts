@@ -14,6 +14,9 @@ export const CANONICAL = {
     behemoth: "0x1F5Cb4aeaE1807Bf60c3b9C0D8aDBCC14e91f12C",
   },
   podMining: "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46",
+  bemToken: "0x5ce033B2bFCa3Af30b3e8C8457DeaF776A8b695a",
+  usdtToken: "0x55d398326f99059fF775485246999027B3197955",
+  bemUsdtPool: "0x2f5ec19ab0583D3FCd9bcbcD9AB416d2858EeA38",
 } as const;
 
 const envSchema = z.object({
@@ -30,6 +33,8 @@ const envSchema = z.object({
   BATCH_QUOTE_TTL_SECONDS: z.coerce.number().int().min(5).max(120).default(15), BATCH_MAX_ORDERS: z.coerce.number().int().min(1).max(50).default(20),
   BATCH_MAX_CANDIDATES: z.coerce.number().int().min(1).max(2_000).default(500), BATCH_REVALIDATION_CONCURRENCY: z.coerce.number().int().min(1).max(20).default(4),
   CHAIN_STARTUP_CHECK: z.string().default("true").transform((v) => v === "true"),
+  BEM_TOKEN_ADDRESS: z.string().default(CANONICAL.bemToken), USDT_TOKEN_ADDRESS: z.string().default(CANONICAL.usdtToken),
+  BEM_USDT_POOL_ADDRESS: z.string().default(CANONICAL.bemUsdtPool), BEM_ORDERBOOK_ENABLED: z.string().default("true").transform((v) => v === "true"),
 });
 
 export type AppConfig = ReturnType<typeof loadConfig>;
@@ -41,6 +46,7 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env) {
   exact(env.CHAIN_ID, CANONICAL.chainId, "CHAIN_ID"); exact(env.FACTORY_ADDRESS, CANONICAL.factory, "FACTORY_ADDRESS");
   exact(env.LEGACY_MARKETPLACE_ADDRESS, CANONICAL.legacyMarketplace, "LEGACY_MARKETPLACE_ADDRESS"); exact(env.SEAPORT_ADDRESS, CANONICAL.seaport, "SEAPORT_ADDRESS");
   exact(env.SEAPORT_VALIDATOR_ADDRESS, CANONICAL.validator, "SEAPORT_VALIDATOR_ADDRESS"); exact(env.CONDUIT_CONTROLLER_ADDRESS, CANONICAL.conduitController, "CONDUIT_CONTROLLER_ADDRESS");
+  exact(env.BEM_TOKEN_ADDRESS, CANONICAL.bemToken, "BEM_TOKEN_ADDRESS"); exact(env.USDT_TOKEN_ADDRESS, CANONICAL.usdtToken, "USDT_TOKEN_ADDRESS"); exact(env.BEM_USDT_POOL_ADDRESS, CANONICAL.bemUsdtPool, "BEM_USDT_POOL_ADDRESS");
   if (env.MAKER_FEE_BPS !== 0 || env.TAKER_FEE_BPS !== 100) throw new Error("Fees must be Maker 0 BPS / Taker 100 BPS");
   const writeEnabled = isAddress(env.FEE_RECIPIENT) && getAddress(env.FEE_RECIPIENT) !== "0x0000000000000000000000000000000000000000";
   return {
@@ -48,6 +54,7 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env) {
     chainId: env.CHAIN_ID, factoryAddress: getAddress(env.FACTORY_ADDRESS), legacyMarketplaceAddress: getAddress(env.LEGACY_MARKETPLACE_ADDRESS),
     seaportAddress: getAddress(env.SEAPORT_ADDRESS), validatorAddress: getAddress(env.SEAPORT_VALIDATOR_ADDRESS), conduitControllerAddress: getAddress(env.CONDUIT_CONTROLLER_ADDRESS),
     circuitCollections: Object.values(CANONICAL.circuitCollections).map(getAddress), podMiningAddress: getAddress(CANONICAL.podMining),
+    bemTokenAddress: getAddress(env.BEM_TOKEN_ADDRESS), usdtTokenAddress: getAddress(env.USDT_TOKEN_ADDRESS), bemUsdtPoolAddress: getAddress(env.BEM_USDT_POOL_ADDRESS), bemOrderbookEnabled: env.BEM_ORDERBOOK_ENABLED,
     feeRecipient: writeEnabled ? getAddress(env.FEE_RECIPIENT) : null, makerFeeBps: env.MAKER_FEE_BPS, takerFeeBps: env.TAKER_FEE_BPS,
     factoryStartBlock: env.FACTORY_START_BLOCK, seaportIndexStartBlock: env.SEAPORT_INDEX_START_BLOCK ? BigInt(env.SEAPORT_INDEX_START_BLOCK) : null,
     confirmations: env.CHAIN_CONFIRMATIONS, revalidationSeconds: env.LISTING_REVALIDATION_SECONDS, staleSeconds: env.LISTING_STALE_SECONDS,

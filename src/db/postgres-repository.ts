@@ -1,6 +1,6 @@
 import type pg from "pg";
 import type { ListingRecord } from "../domain/listing.js";
-import { CIRCUIT_RESERVING_LISTING_STATUSES, RESERVING_LISTING_STATUSES, isCircuitListing } from "../domain/listing.js";
+import { CIRCUIT_RESERVING_LISTING_STATUSES, RESERVING_LISTING_STATUSES, isBemListing, isCircuitListing } from "../domain/listing.js";
 import { DomainError } from "../domain/errors.js";
 import { assertListingCapacity, calculateListingCapacity } from "../domain/listing-capacity.js";
 import { decodeMarketCursor, encodeMarketCursor, type InsertWithCapacityCheckInput, type ListingCapacityKey, type ListingQuery, type ListingRepository, type ListingValidationPatch, type MarketIdentity, type MarketPageQuery, type SweepCandidateQuery } from "./repository.js";
@@ -14,12 +14,19 @@ function map(row: any): ListingRecord {
     feeTotalWei: String(row.fee_total_wei), buyerTotalWei: String(row.buyer_total_wei), parameters: row.parameters_json, signature: row.signature,
     status: row.status, validationState: row.validation_state, validationDetails: row.validation_details_json, validatorCodes: row.validator_codes_json,
     startTime: String(row.start_time), endTime: String(row.end_time), createdAt: new Date(row.created_at).toISOString(), updatedAt: new Date(row.updated_at).toISOString(), lastValidatedAt: new Date(row.last_validated_at).toISOString(),
+    marketPair: row.market_pair, orderSide: row.order_side, baseTokenAddress: row.base_token_address, quoteTokenAddress: row.quote_token_address,
+    baseDecimals: row.base_decimals, quoteDecimals: row.quote_decimals, baseAmountInitial: row.base_amount_initial == null ? null : String(row.base_amount_initial), baseAmountRemaining: row.base_amount_remaining == null ? null : String(row.base_amount_remaining),
+    unitPriceQuoteAtomic: row.unit_price_quote_atomic == null ? null : String(row.unit_price_quote_atomic), sellerQuoteTotalAtomic: row.seller_quote_total_atomic == null ? null : String(row.seller_quote_total_atomic), feeQuoteTotalAtomic: row.fee_quote_total_atomic == null ? null : String(row.fee_quote_total_atomic), buyerQuoteTotalAtomic: row.buyer_quote_total_atomic == null ? null : String(row.buyer_quote_total_atomic), fillStepBaseAtomic: row.fill_step_base_atomic == null ? null : String(row.fill_step_base_atomic),
   };
 }
 
 export class PostgresListingRepository implements ListingRepository {
   constructor(private readonly pool: pg.Pool) {}
-  async ready() { await this.pool.query("SELECT 1"); return true; }
+  async ready() {
+    const result = await this.pool.query("SELECT count(*)::int present FROM information_schema.columns WHERE table_schema='public' AND table_name='seaport_listings' AND column_name=ANY($1::text[])", [["market_pair", "base_amount_remaining", "unit_price_quote_atomic", "fill_step_base_atomic"]]);
+    if (Number(result.rows[0]?.present ?? 0) !== 4) throw new DomainError("BEM_MARKET_DISABLED", "Database migration 0004 is required", 503);
+    return true;
+  }
   async get(orderHash: string) { const result = await this.pool.query("SELECT * FROM seaport_listings WHERE order_hash=$1", [orderHash.toLowerCase()]); return result.rows[0] ? map(result.rows[0]) : null; }
   async getMany(orderHashes: string[]) {
     if (!orderHashes.length) return [];
@@ -27,8 +34,8 @@ export class PostgresListingRepository implements ListingRepository {
     return result.rows.map(map);
   }
   private async insertUsing(executor: Pick<pg.Pool, "query"> | pg.PoolClient, l: ListingRecord) {
-    const values = [l.orderHash.toLowerCase(), l.chainId, l.seaportAddress.toLowerCase(), l.offerer.toLowerCase(), l.processorAddress.toLowerCase(), l.assetStandard, l.collectionAddress.toLowerCase(), l.transistorsAddress?.toLowerCase() ?? null, l.tokenId, l.assetType, l.initialQuantity, l.remainingQuantity, l.sellerUnitPriceWei, l.takerFeePerUnitWei, l.buyerUnitTotalWei, l.sellerTotalWei, l.feeTotalWei, l.buyerTotalWei, l.startTime, l.endTime, l.parameters.orderType, l.parameters.zone, l.parameters.zoneHash, l.parameters.conduitKey, l.parameters.counter, l.parameters.salt, JSON.stringify(l.parameters), l.signature, l.status, l.validationState, JSON.stringify(l.validationDetails), JSON.stringify(l.validatorCodes), l.lastValidatedAt];
-    const sql = `INSERT INTO seaport_listings (order_hash,chain_id,seaport_address,offerer,processor_address,asset_standard,collection_address,transistors_address,token_id,asset_type,initial_quantity,remaining_quantity,seller_unit_price_wei,taker_fee_per_unit_wei,buyer_unit_total_wei,seller_total_wei,fee_total_wei,buyer_total_wei,start_time,end_time,order_type,zone,zone_hash,conduit_key,counter,salt,parameters_json,signature,status,validation_state,validation_details_json,validator_codes_json,last_validated_at) VALUES (${values.map((_, i) => `$${i + 1}`).join(",")}) ON CONFLICT (order_hash) DO NOTHING RETURNING *`;
+    const values = [l.orderHash.toLowerCase(), l.chainId, l.seaportAddress.toLowerCase(), l.offerer.toLowerCase(), l.processorAddress?.toLowerCase() ?? null, l.assetStandard, l.collectionAddress.toLowerCase(), l.transistorsAddress?.toLowerCase() ?? null, l.tokenId, l.assetType, l.initialQuantity, l.remainingQuantity, l.sellerUnitPriceWei, l.takerFeePerUnitWei, l.buyerUnitTotalWei, l.sellerTotalWei, l.feeTotalWei, l.buyerTotalWei, l.startTime, l.endTime, l.parameters.orderType, l.parameters.zone, l.parameters.zoneHash, l.parameters.conduitKey, l.parameters.counter, l.parameters.salt, JSON.stringify(l.parameters), l.signature, l.status, l.validationState, JSON.stringify(l.validationDetails), JSON.stringify(l.validatorCodes), l.lastValidatedAt, l.marketPair ?? null, l.orderSide ?? null, l.baseTokenAddress?.toLowerCase() ?? null, l.quoteTokenAddress?.toLowerCase() ?? null, l.baseDecimals ?? null, l.quoteDecimals ?? null, l.baseAmountInitial ?? null, l.baseAmountRemaining ?? null, l.unitPriceQuoteAtomic ?? null, l.sellerQuoteTotalAtomic ?? null, l.feeQuoteTotalAtomic ?? null, l.buyerQuoteTotalAtomic ?? null, l.fillStepBaseAtomic ?? null];
+    const sql = `INSERT INTO seaport_listings (order_hash,chain_id,seaport_address,offerer,processor_address,asset_standard,collection_address,transistors_address,token_id,asset_type,initial_quantity,remaining_quantity,seller_unit_price_wei,taker_fee_per_unit_wei,buyer_unit_total_wei,seller_total_wei,fee_total_wei,buyer_total_wei,start_time,end_time,order_type,zone,zone_hash,conduit_key,counter,salt,parameters_json,signature,status,validation_state,validation_details_json,validator_codes_json,last_validated_at,market_pair,order_side,base_token_address,quote_token_address,base_decimals,quote_decimals,base_amount_initial,base_amount_remaining,unit_price_quote_atomic,seller_quote_total_atomic,fee_quote_total_atomic,buyer_quote_total_atomic,fill_step_base_atomic) VALUES (${values.map((_, i) => `$${i + 1}`).join(",")}) ON CONFLICT (order_hash) DO NOTHING RETURNING *`;
     const result = await executor.query(sql, values);
     if (result.rows[0]) return map(result.rows[0]);
     const existing = await executor.query("SELECT * FROM seaport_listings WHERE order_hash=$1", [l.orderHash.toLowerCase()]);
@@ -54,6 +61,10 @@ export class PostgresListingRepository implements ListingRepository {
     const count = Number(result.rows[0]?.reserving_count ?? 0); const owner = input.currentOwner.toLowerCase() === input.offerer.toLowerCase();
     return calculateListingCapacity(owner ? "1" : "0", count > 0 ? "1" : "0", count);
   }
+  async getBemListingCapacity(input: { offerer: string; walletBalance: string; nowSeconds?: string }) {
+    const result = await this.pool.query("SELECT coalesce(sum(base_amount_remaining),0) reserved_quantity,count(*) reserving_count FROM seaport_listings WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' AND offerer=$1 AND end_time>$2 AND status=ANY($3::text[])", [input.offerer.toLowerCase(), input.nowSeconds ?? String(Math.floor(Date.now() / 1_000)), [...RESERVING_LISTING_STATUSES]]);
+    return calculateListingCapacity(input.walletBalance, String(result.rows[0]?.reserved_quantity ?? "0"), Number(result.rows[0]?.reserving_count ?? 0));
+  }
   async insertWithCapacityCheck({ listing, walletBalance, nowSeconds, readCurrentOwner }: InsertWithCapacityCheckInput) {
     const client = await this.pool.connect();
     try {
@@ -67,6 +78,10 @@ export class PostgresListingRepository implements ListingRepository {
         if (currentOwner.toLowerCase() !== listing.offerer.toLowerCase()) throw new DomainError("CIRCUIT_NOT_OWNER", "This wallet is no longer the owner", 409);
         const result = await client.query("SELECT count(*) reserving_count FROM seaport_listings WHERE asset_standard='ERC721' AND offerer=$1 AND collection_address=$2 AND token_id=$3 AND end_time>$4 AND status=ANY($5::text[])", [listing.offerer.toLowerCase(), listing.collectionAddress.toLowerCase(), listing.tokenId, nowSeconds ?? String(Math.floor(Date.now() / 1_000)), [...CIRCUIT_RESERVING_LISTING_STATUSES]]);
         if (Number(result.rows[0]?.reserving_count ?? 0) > 0) throw new DomainError("CIRCUIT_ALREADY_LISTED", "This Circuit already has an open listing", 409);
+      } else if (isBemListing(listing)) {
+        const result = await client.query("SELECT coalesce(sum(base_amount_remaining),0) reserved_quantity,count(*) reserving_count FROM seaport_listings WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' AND offerer=$1 AND end_time>$2 AND status=ANY($3::text[])", [listing.offerer.toLowerCase(), nowSeconds ?? String(Math.floor(Date.now() / 1_000)), [...RESERVING_LISTING_STATUSES]]);
+        const capacity = calculateListingCapacity(walletBalance, String(result.rows[0]?.reserved_quantity ?? "0"), Number(result.rows[0]?.reserving_count ?? 0));
+        if (BigInt(listing.initialQuantity) > BigInt(capacity.availableToList)) throw new DomainError("BEM_LISTING_CAPACITY_EXCEEDED", "BEM listing exceeds available wallet balance", 409, capacity);
       } else {
         const aggregate = await this.capacityAggregate(client, { offerer: listing.offerer, transistorsAddress: listing.transistorsAddress!, tokenId: listing.tokenId, ...(nowSeconds ? { nowSeconds } : {}) });
         const capacity = calculateListingCapacity(walletBalance, aggregate.reservedListingQuantity, aggregate.reservingListingCount);
@@ -108,7 +123,7 @@ export class PostgresListingRepository implements ListingRepository {
     return result.rows.map(map);
   }
   async updateValidation(orderHash: string, patch: ListingValidationPatch) {
-    const keys: Record<string, string> = { status: "status", remainingQuantity: "remaining_quantity", validationState: "validation_state", validationDetails: "validation_details_json", validatorCodes: "validator_codes_json", lastValidatedAt: "last_validated_at", updatedAt: "updated_at" };
+    const keys: Record<string, string> = { status: "status", remainingQuantity: "remaining_quantity", baseAmountRemaining: "base_amount_remaining", validationState: "validation_state", validationDetails: "validation_details_json", validatorCodes: "validator_codes_json", lastValidatedAt: "last_validated_at", updatedAt: "updated_at" };
     const entries = Object.entries(patch).filter(([k]) => keys[k]); if (!entries.length) return this.get(orderHash);
     const values = entries.map(([, value]) => typeof value === "object" ? JSON.stringify(value) : value); values.push(orderHash.toLowerCase());
     const result = await this.pool.query(`UPDATE seaport_listings SET ${entries.map(([key], i) => `${keys[key]}=$${i + 1}`).join(",")} WHERE order_hash=$${values.length} RETURNING *`, values);
@@ -120,6 +135,29 @@ export class PostgresListingRepository implements ListingRepository {
   async listFills(transistorsAddress: string, tokenId: string, limit = 100) {
     const result = await this.pool.query("SELECT * FROM seaport_fills WHERE transistors_address=$1 AND token_id=$2 ORDER BY block_number DESC,log_index DESC LIMIT $3", [transistorsAddress.toLowerCase(), tokenId, Math.min(limit, 200)]);
     return result.rows.map((row) => ({ orderHash: row.order_hash, txHash: row.tx_hash, logIndex: row.log_index, blockNumber: String(row.block_number), blockTimestamp: new Date(row.block_timestamp).toISOString(), seller: row.seller, buyer: row.buyer, assetStandard: row.asset_standard ?? "ERC1155", collectionAddress: row.collection_address ?? row.transistors_address, transistorsAddress: row.transistors_address, tokenId: String(row.token_id), quantity: String(row.quantity), sellerUnitPriceWei: String(row.seller_unit_price_wei), sellerProceedsWei: String(row.seller_proceeds_wei), takerFeeWei: String(row.taker_fee_wei), buyerTotalWei: String(row.buyer_total_wei), source: "SEAPORT_LISTING_SALE" as const }));
+  }
+  async listBemPage(input: { statuses?: ListingRecord["status"][]; limit: number; cursor?: string; sort?: "price_asc" | "newest" }) {
+    const clauses = ["asset_standard='ERC20'", "market_pair='BEM_USDT'", "order_side='ASK'", "status=ANY($1::text[])", "end_time>extract(epoch from now())"];
+    const values: unknown[] = [input.statuses ?? ["ACTIVE", "PARTIALLY_FILLED"]];
+    if (input.cursor) { values.push(input.cursor.toLowerCase()); clauses.push(`order_hash>$${values.length}`); }
+    const limit = Math.min(Math.max(input.limit, 1), 100); values.push(limit + 1);
+    const order = input.sort === "newest" ? "created_at DESC,order_hash ASC" : "unit_price_quote_atomic ASC,order_hash ASC";
+    const result = await this.pool.query(`SELECT * FROM seaport_listings WHERE ${clauses.join(" AND ")} ORDER BY ${order} LIMIT $${values.length}`, values);
+    const rows = result.rows.map(map); const hasMore = rows.length > limit; const listings = rows.slice(0, limit);
+    return { listings, nextCursor: hasMore ? listings.at(-1)?.orderHash ?? null : null };
+  }
+  async listBemFills(limit = 100) {
+    const result = await this.pool.query("SELECT * FROM seaport_fills WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' ORDER BY block_number DESC,log_index DESC LIMIT $1", [Math.min(limit, 200)]);
+    return result.rows.map((row) => ({ orderHash: row.order_hash, txHash: row.tx_hash, logIndex: row.log_index, blockNumber: String(row.block_number), blockTimestamp: new Date(row.block_timestamp).toISOString(), seller: row.seller, buyer: row.buyer, baseAmountFilled: String(row.base_amount_filled), sellerQuoteAmount: String(row.seller_quote_amount), feeQuoteAmount: String(row.fee_quote_amount), buyerQuoteAmount: String(row.buyer_quote_amount), unitPriceQuoteAtomic: String(row.unit_price_quote_atomic), source: "SEAPORT_BEM_SALE" }));
+  }
+  async bemSummary() {
+    const result = await this.pool.query(`SELECT
+      (SELECT unit_price_quote_atomic FROM seaport_listings WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' AND status IN ('ACTIVE','PARTIALLY_FILLED') AND end_time>extract(epoch from now()) ORDER BY unit_price_quote_atomic,order_hash LIMIT 1) best_ask,
+      (SELECT unit_price_quote_atomic FROM seaport_fills WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' ORDER BY block_number DESC,log_index DESC LIMIT 1) last_sale,
+      (SELECT count(*) FROM seaport_listings WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' AND status IN ('ACTIVE','PARTIALLY_FILLED') AND end_time>extract(epoch from now())) active_orders,
+      (SELECT coalesce(sum(base_amount_remaining),0) FROM seaport_listings WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' AND status IN ('ACTIVE','PARTIALLY_FILLED') AND end_time>extract(epoch from now())) open_bem,
+      (SELECT coalesce(sum(seller_quote_amount),0) FROM seaport_fills WHERE asset_standard='ERC20' AND market_pair='BEM_USDT' AND block_timestamp>=now()-interval '24 hours') volume_24h`);
+    const row = result.rows[0]; return { bestAskQuoteAtomic: row.best_ask == null ? null : String(row.best_ask), lastSaleQuoteAtomic: row.last_sale == null ? null : String(row.last_sale), activeOrders: String(row.active_orders), openBemAtomic: String(row.open_bem), orderbookVolume24hQuoteAtomic: String(row.volume_24h), generatedAt: new Date().toISOString() };
   }
   async listCircuitPage(input: { collectionAddress: string; tokenId?: string; statuses?: ListingRecord["status"][]; limit: number; cursor?: string; sort?: "price_asc" | "newest" }) {
     const clauses = ["asset_standard='ERC721'", "collection_address=$1", "status=ANY($2::text[])", "end_time>extract(epoch from now())"];

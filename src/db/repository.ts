@@ -1,8 +1,8 @@
 import type { ListingRecord, ListingStatus } from "../domain/listing.js";
 import { DomainError } from "../domain/errors.js";
 
-export type ListingQuery = { assetStandard?: "ERC1155" | "ERC721"; collectionAddress?: string; transistorsAddress?: string; tokenId?: string; offerer?: string; statuses?: ListingStatus[]; limit?: number; cursor?: string };
-export type ListingValidationPatch = Partial<Pick<ListingRecord, "status" | "remainingQuantity" | "validationState" | "validationDetails" | "validatorCodes" | "lastValidatedAt" | "updatedAt">>;
+export type ListingQuery = { assetStandard?: "ERC1155" | "ERC721" | "ERC20"; collectionAddress?: string; transistorsAddress?: string; tokenId?: string; offerer?: string; statuses?: ListingStatus[]; limit?: number; cursor?: string };
+export type ListingValidationPatch = Partial<Pick<ListingRecord, "status" | "remainingQuantity" | "baseAmountRemaining" | "validationState" | "validationDetails" | "validatorCodes" | "lastValidatedAt" | "updatedAt">>;
 export type MarketPageQuery = { transistorsAddress: string; tokenId: string; statuses?: ListingStatus[]; limit: number; cursor?: string };
 export type MarketPage = { listings: ListingRecord[]; nextCursor: string | null };
 export type SweepCandidateQuery = { transistorsAddress: string; tokenId: string; excludeOfferer: string; maxSellerUnitPriceWei: string; statuses: ListingStatus[]; limit: number };
@@ -51,5 +51,9 @@ export interface ListingRepository {
   listCircuitPage(input: { collectionAddress: string; tokenId?: string; statuses?: ListingStatus[]; limit: number; cursor?: string; sort?: "price_asc" | "newest" }): Promise<MarketPage>;
   listCircuitFills(collectionAddress: string, tokenId?: string, limit?: number): Promise<FillRecord[]>;
   circuitSummaries(collections: string[]): Promise<{ summaries: Array<{ collectionAddress: string; bestAskWei: string | null; bestAskBuyerTotalWei: string | null; activeListingCount: string; lastSaleWei: string | null; lastSaleAt: string | null; lastSaleTxHash: string | null; volume24hWei: string; volumeAllTimeWei: string; fillCount24h: string; indexedSaleCount: string }>; generatedAt: string; lastIndexedBlock: string | null; indexerStale: boolean }>;
+  getBemListingCapacity?(input: { offerer: string; walletBalance: string; nowSeconds?: string }): Promise<ListingCapacity>;
+  listBemPage?(input: { statuses?: ListingStatus[]; limit: number; cursor?: string; sort?: "price_asc" | "newest" }): Promise<MarketPage>;
+  listBemFills?(limit?: number): Promise<unknown[]>;
+  bemSummary?(): Promise<Record<string, unknown>>;
   close(): Promise<void>;
 }

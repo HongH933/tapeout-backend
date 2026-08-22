@@ -2,10 +2,10 @@ import type { PublicClient } from "viem";
 import type { AppConfig } from "../config.js";
 import { DomainError } from "../domain/errors.js";
 import type { ListingRecord, SignedListingInput } from "../domain/listing.js";
-import { isCircuitListing } from "../domain/listing.js";
+import { isBemListing, isCircuitListing } from "../domain/listing.js";
 import { validateMarketplaceOrderShape } from "../domain/order-shape.js";
 import { getOrderHash, verifyOrderSignature } from "../domain/signature.js";
-import { circuitAbi, factoryAbi, processorAbi, seaportAbi, transistorsAbi, validatorAbi } from "./contracts.js";
+import { circuitAbi, erc20Abi, factoryAbi, processorAbi, seaportAbi, transistorsAbi, validatorAbi } from "./contracts.js";
 
 const address = (value: string) => value as `0x${string}`;
 function validatorOrder(parameters: SignedListingInput["parameters"], signature: string) {
@@ -71,24 +71,34 @@ export async function readListingWalletBalance(client: PublicClient, offerer: st
   return (await client.readContract({ address: address(transistorsAddress), abi: transistorsAbi, functionName: "balanceOf", args: [address(offerer), BigInt(tokenId)] })).toString();
 }
 
+export async function readBemBalance(client: PublicClient, config: AppConfig, offerer: string) {
+  return (await client.readContract({ address: address(config.bemTokenAddress), abi: erc20Abi, functionName: "balanceOf", args: [address(offerer)] })).toString();
+}
+
 export async function validateSignedListing(client: PublicClient, config: AppConfig, input: SignedListingInput): Promise<ListingRecord> {
   if (!config.feeRecipient) throw new DomainError("WRITE_API_DISABLED", "FEE_RECIPIENT is not configured", 503);
   const offer = input.parameters.offer[0]; if (!offer) throw new DomainError("INVALID_STRUCTURE", "Missing offer");
   const assetStandard = input.assetStandard ?? "ERC1155";
-  const collectionAddress = input.collectionAddress ?? offer.token;
+  if (assetStandard === "ERC20" && (!config.bemOrderbookEnabled || input.marketPair !== "BEM_USDT" || input.orderSide !== "ASK")) throw new DomainError("BEM_MARKET_DISABLED", "BEM ASK orderbook is disabled or invalid", 503);
+  const collectionAddress = assetStandard === "ERC20" ? config.bemTokenAddress : input.collectionAddress ?? offer.token;
   if (collectionAddress.toLowerCase() !== offer.token.toLowerCase()) throw new DomainError("INVALID_ASSET", "Collection address does not match the offered token");
   const circuitOwner = assetStandard === "ERC721" ? await validateCircuitAsset(client, config, collectionAddress, offer.identifierOrCriteria) : null;
-  if (assetStandard === "ERC1155") await validateAsset(client, config, input.processorAddress, offer.token, offer.identifierOrCriteria);
-  if (assetStandard === "ERC721" && input.processorAddress.toLowerCase() !== collectionAddress.toLowerCase()) throw new DomainError("INVALID_ASSET", "Circuit processor address must equal its collection address");
+  if (assetStandard === "ERC1155") { if (!input.processorAddress) throw new DomainError("INVALID_ASSET", "Processor address is required"); await validateAsset(client, config, input.processorAddress, offer.token, offer.identifierOrCriteria); }
+  if (assetStandard === "ERC721" && input.processorAddress?.toLowerCase() !== collectionAddress.toLowerCase()) throw new DomainError("INVALID_ASSET", "Circuit processor address must equal its collection address");
+  if (assetStandard === "ERC20" && offer.token.toLowerCase() !== config.bemTokenAddress.toLowerCase()) throw new DomainError("BEM_TOKEN_MISMATCH", "Offered token is not configured BEM");
   const now = BigInt(Math.floor(Date.now() / 1000));
-  const math = validateMarketplaceOrderShape(input.parameters, { assetStandard, collectionAddress, tokenId: offer.identifierOrCriteria, feeRecipient: config.feeRecipient, now, maxDuration: BigInt(config.maxListingDurationSeconds) });
+  const tokenDecimals = assetStandard === "ERC20" ? await Promise.all([
+    client.readContract({ address: address(config.bemTokenAddress), abi: erc20Abi, functionName: "decimals" }),
+    client.readContract({ address: address(config.usdtTokenAddress), abi: erc20Abi, functionName: "decimals" }),
+  ]) : null;
+  const math = validateMarketplaceOrderShape(input.parameters, { assetStandard, collectionAddress, tokenId: offer.identifierOrCriteria, feeRecipient: config.feeRecipient, now, maxDuration: BigInt(config.maxListingDurationSeconds), ...(tokenDecimals ? { quoteTokenAddress: config.usdtTokenAddress, baseDecimals: tokenDecimals[0], quoteDecimals: tokenDecimals[1] } : {}) });
   const orderHash = getOrderHash(input.parameters);
   verifyOrderSignature(input.parameters, input.signature, config.chainId, config.seaportAddress);
   const [code, counter, inventory, approvalState, status, validatorCodes] = await Promise.all([
     client.getCode({ address: address(input.parameters.offerer) }),
     client.readContract({ address: address(config.seaportAddress), abi: seaportAbi, functionName: "getCounter", args: [address(input.parameters.offerer)] }),
-    assetStandard === "ERC721" ? Promise.resolve(circuitOwner) : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "balanceOf", args: [address(input.parameters.offerer), BigInt(offer.identifierOrCriteria)] }),
-    assetStandard === "ERC721" ? readCircuitApproval(client, config, collectionAddress, offer.identifierOrCriteria, input.parameters.offerer) : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "isApprovedForAll", args: [address(input.parameters.offerer), address(config.seaportAddress)] }),
+    assetStandard === "ERC721" ? Promise.resolve(circuitOwner) : assetStandard === "ERC20" ? client.readContract({ address: address(offer.token), abi: erc20Abi, functionName: "balanceOf", args: [address(input.parameters.offerer)] }) : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "balanceOf", args: [address(input.parameters.offerer), BigInt(offer.identifierOrCriteria)] }),
+    assetStandard === "ERC721" ? readCircuitApproval(client, config, collectionAddress, offer.identifierOrCriteria, input.parameters.offerer) : assetStandard === "ERC20" ? client.readContract({ address: address(offer.token), abi: erc20Abi, functionName: "allowance", args: [address(input.parameters.offerer), address(config.seaportAddress)] }) : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "isApprovedForAll", args: [address(input.parameters.offerer), address(config.seaportAddress)] }),
     client.readContract({ address: address(config.seaportAddress), abi: seaportAbi, functionName: "getOrderStatus", args: [address(orderHash)] }),
     canonicalValidator(client, config, input),
   ]);
@@ -96,16 +106,20 @@ export async function validateSignedListing(client: PublicClient, config: AppCon
   if (counter.toString() !== input.parameters.counter) throw new DomainError("INVALID_COUNTER", "Order counter does not match Seaport counter");
   if (assetStandard === "ERC721" && String(inventory).toLowerCase() !== input.parameters.offerer.toLowerCase()) throw new DomainError("CIRCUIT_NOT_OWNER", "This wallet is no longer the owner", 409);
   if (assetStandard === "ERC1155" && typeof inventory === "bigint" && inventory < BigInt(offer.startAmount)) throw new DomainError("INVALID_BALANCE", "Seller balance is below listing quantity");
-  const approval = typeof approvalState === "boolean" ? approvalState : approvalState.valid;
-  if (!approval) throw new DomainError(assetStandard === "ERC721" ? "ERC721_APPROVAL_MISSING" : "INVALID_APPROVAL", "Seller has not approved Canonical Seaport");
+  if (assetStandard === "ERC20" && typeof inventory === "bigint" && inventory < BigInt(offer.startAmount)) throw new DomainError("INSUFFICIENT_BEM_BALANCE", "Seller BEM balance is below listing quantity");
+  const approval = typeof approvalState === "bigint" ? approvalState >= BigInt(offer.startAmount) : typeof approvalState === "boolean" ? approvalState : approvalState.valid;
+  if (!approval) throw new DomainError(assetStandard === "ERC721" ? "ERC721_APPROVAL_MISSING" : assetStandard === "ERC20" ? "INSUFFICIENT_BEM_ALLOWANCE" : "INVALID_APPROVAL", "Seller has not approved Canonical Seaport");
   const [isValidated, isCancelled, totalFilled, totalSize] = status;
   if (isCancelled) throw new DomainError("ORDER_CANCELLED", "Order is cancelled"); if (totalSize > 0n && totalFilled >= totalSize) throw new DomainError("ORDER_FILLED", "Order is fully filled");
   const remaining = totalSize === 0n ? BigInt(offer.startAmount) : BigInt(offer.startAmount) * (totalSize - totalFilled) / totalSize;
   if (assetStandard === "ERC721" && totalFilled > 0n && totalSize > totalFilled) throw new DomainError("ERC721_PARTIAL_FILL_FORBIDDEN", "Circuit listings cannot be partially filled");
   const timestamp = new Date().toISOString();
-  return { orderHash, chainId: config.chainId, seaportAddress: config.seaportAddress, offerer: input.parameters.offerer, processorAddress: input.processorAddress,
-    assetStandard, collectionAddress, transistorsAddress: assetStandard === "ERC1155" ? offer.token : null, tokenId: offer.identifierOrCriteria, assetType: assetStandard === "ERC721" ? "CIRCUIT" : offer.identifierOrCriteria === "0" ? "NAND" : "LATCH", initialQuantity: offer.startAmount,
-    remainingQuantity: remaining.toString(), ...math, parameters: input.parameters, signature: input.signature, status: assetStandard === "ERC721" ? "ACTIVE" : remaining < BigInt(offer.startAmount) ? "PARTIALLY_FILLED" : "ACTIVE",
+  const legacyMath: Pick<ListingRecord, "sellerUnitPriceWei" | "takerFeePerUnitWei" | "buyerUnitTotalWei" | "sellerTotalWei" | "feeTotalWei" | "buyerTotalWei"> = assetStandard === "ERC20"
+    ? { sellerUnitPriceWei: (math as any).unitPriceQuoteAtomic, takerFeePerUnitWei: "0", buyerUnitTotalWei: (math as any).unitPriceQuoteAtomic, sellerTotalWei: (math as any).sellerQuoteTotalAtomic, feeTotalWei: (math as any).takerFeeQuoteAtomic, buyerTotalWei: (math as any).buyerQuoteTotalAtomic }
+    : { sellerUnitPriceWei: (math as any).sellerUnitPriceWei, takerFeePerUnitWei: (math as any).takerFeePerUnitWei, buyerUnitTotalWei: (math as any).buyerUnitTotalWei, sellerTotalWei: (math as any).sellerTotalWei, feeTotalWei: (math as any).feeTotalWei, buyerTotalWei: (math as any).buyerTotalWei };
+  return { orderHash, chainId: config.chainId, seaportAddress: config.seaportAddress, offerer: input.parameters.offerer, processorAddress: assetStandard === "ERC20" ? null : input.processorAddress ?? null,
+    assetStandard, collectionAddress, transistorsAddress: assetStandard === "ERC1155" ? offer.token : null, tokenId: offer.identifierOrCriteria, assetType: assetStandard === "ERC721" ? "CIRCUIT" : assetStandard === "ERC20" ? "BEM" : offer.identifierOrCriteria === "0" ? "NAND" : "LATCH", initialQuantity: offer.startAmount,
+    remainingQuantity: remaining.toString(), ...legacyMath, ...(assetStandard === "ERC20" ? { marketPair: "BEM_USDT" as const, orderSide: "ASK" as const, baseTokenAddress: config.bemTokenAddress, quoteTokenAddress: config.usdtTokenAddress, baseDecimals: tokenDecimals![0], quoteDecimals: tokenDecimals![1], baseAmountInitial: offer.startAmount, baseAmountRemaining: remaining.toString(), unitPriceQuoteAtomic: (math as any).unitPriceQuoteAtomic, sellerQuoteTotalAtomic: (math as any).sellerQuoteTotalAtomic, feeQuoteTotalAtomic: (math as any).takerFeeQuoteAtomic, buyerQuoteTotalAtomic: (math as any).buyerQuoteTotalAtomic, fillStepBaseAtomic: (math as any).fillStepBaseAtomic } : {}), parameters: input.parameters, signature: input.signature, status: assetStandard === "ERC721" ? "ACTIVE" : remaining < BigInt(offer.startAmount) ? "PARTIALLY_FILLED" : "ACTIVE",
     validationState: isValidated ? "ONCHAIN_VALIDATED" : "SIGNED_OFFCHAIN_VALID", validationDetails: { isValidated, totalFilled: totalFilled.toString(), totalSize: totalSize.toString(), canonicalValidator: "PASSED" },
     validatorCodes, startTime: input.parameters.startTime, endTime: input.parameters.endTime, createdAt: timestamp, updatedAt: timestamp, lastValidatedAt: timestamp };
 }
@@ -125,15 +139,15 @@ async function inspectListingPatch(client: PublicClient, config: AppConfig, list
   const offer = listing.parameters.offer[0]!;
   const [counter, inventory, approvalState, status, validatorCodes] = await Promise.all([
     client.readContract({ address: address(config.seaportAddress), abi: seaportAbi, functionName: "getCounter", args: [address(listing.offerer)] }),
-    isCircuitListing(listing) ? client.readContract({ address: address(listing.collectionAddress), abi: circuitAbi, functionName: "ownerOf", args: [BigInt(listing.tokenId)] }).catch(() => "0x0000000000000000000000000000000000000000") : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "balanceOf", args: [address(listing.offerer), BigInt(listing.tokenId)] }),
-    isCircuitListing(listing) ? readCircuitApproval(client, config, listing.collectionAddress, listing.tokenId, listing.offerer).catch(() => ({ approved: false, approvedForAll: false, valid: false })) : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "isApprovedForAll", args: [address(listing.offerer), address(config.seaportAddress)] }),
+    isCircuitListing(listing) ? client.readContract({ address: address(listing.collectionAddress), abi: circuitAbi, functionName: "ownerOf", args: [BigInt(listing.tokenId)] }).catch(() => "0x0000000000000000000000000000000000000000") : isBemListing(listing) ? client.readContract({ address: address(offer.token), abi: erc20Abi, functionName: "balanceOf", args: [address(listing.offerer)] }) : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "balanceOf", args: [address(listing.offerer), BigInt(listing.tokenId)] }),
+    isCircuitListing(listing) ? readCircuitApproval(client, config, listing.collectionAddress, listing.tokenId, listing.offerer).catch(() => ({ approved: false, approvedForAll: false, valid: false })) : isBemListing(listing) ? client.readContract({ address: address(offer.token), abi: erc20Abi, functionName: "allowance", args: [address(listing.offerer), address(config.seaportAddress)] }) : client.readContract({ address: address(offer.token), abi: transistorsAbi, functionName: "isApprovedForAll", args: [address(listing.offerer), address(config.seaportAddress)] }),
     client.readContract({ address: address(config.seaportAddress), abi: seaportAbi, functionName: "getOrderStatus", args: [address(listing.orderHash)] }),
     canonicalValidator(client, config, { processorAddress: listing.processorAddress, parameters: listing.parameters, signature: listing.signature, orderHash: listing.orderHash }, false),
   ]);
   const circuit = isCircuitListing(listing);
   const owner = circuit ? String(inventory) : null;
   const balance = circuit ? (owner?.toLowerCase() === listing.offerer.toLowerCase() ? 1n : 0n) : inventory as bigint;
-  const approval = typeof approvalState === "boolean" ? approvalState : approvalState.valid;
+  const approval = typeof approvalState === "bigint" ? approvalState >= BigInt(listing.remainingQuantity) : typeof approvalState === "boolean" ? approvalState : approvalState.valid;
   const [isValidated, isCancelled, totalFilled, totalSize] = status; const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
   let next: ListingRecord["status"] = "ACTIVE";
   if (totalSize > 0n && totalFilled >= totalSize) next = "FILLED"; else if (isCancelled) next = "CANCELLED"; else if (BigInt(listing.endTime) <= nowSeconds) next = "EXPIRED"; else if (counter.toString() !== listing.parameters.counter) next = "INVALID_COUNTER";
@@ -142,7 +156,7 @@ async function inspectListingPatch(client: PublicClient, config: AppConfig, list
   else if (!approval || validatorCodes.errors.includes(401)) next = "INVALID_APPROVAL"; else if (validatorCodes.errors.includes(402)) next = "INVALID_BALANCE"; else if (validatorCodes.errors.length) next = "STALE"; else if (totalFilled > 0n) next = "PARTIALLY_FILLED";
   const remaining = next === "FILLED" ? 0n : circuit ? 1n : totalSize === 0n ? BigInt(listing.initialQuantity) : BigInt(listing.initialQuantity) * (totalSize - totalFilled) / totalSize;
   const timestamp = new Date().toISOString();
-  const patch = { status: next, remainingQuantity: remaining.toString(), validationState: isValidated ? "ONCHAIN_VALIDATED" : "SIGNED_OFFCHAIN_VALID", validationDetails: { isValidated, totalFilled: totalFilled.toString(), totalSize: totalSize.toString(), canonicalValidator: "PASSED", balance: balance.toString(), owner, approval, counter: counter.toString() }, validatorCodes, lastValidatedAt: timestamp, updatedAt: timestamp } as const;
+  const patch = { status: next, remainingQuantity: remaining.toString(), ...(isBemListing(listing) ? { baseAmountRemaining: remaining.toString() } : {}), validationState: isValidated ? "ONCHAIN_VALIDATED" : "SIGNED_OFFCHAIN_VALID", validationDetails: { isValidated, totalFilled: totalFilled.toString(), totalSize: totalSize.toString(), canonicalValidator: "PASSED", balance: balance.toString(), owner, approval, counter: counter.toString() }, validatorCodes, lastValidatedAt: timestamp, updatedAt: timestamp } as const;
   return { patch, balance, approval, counter, isValidated, isCancelled, totalFilled, totalSize, validatorCodes };
 }
 

@@ -10,9 +10,11 @@ import type { ListingRepository } from "./db/repository.js";
 import { DomainError } from "./domain/errors.js";
 import { assertListingCapacity } from "./domain/listing-capacity.js";
 import { quoteOrder } from "./domain/order-math.js";
+import { quoteBemAsk, quoteBemFill } from "./domain/bem-order-math.js";
 import { assertBatchQuoteExpectation, buildSelectedBatchQuote, buildSweepBatchQuote, type BatchCandidate } from "./domain/batch-quote.js";
-import { circuitCollectionAllowed, inspectListings, readListingWalletBalance, resolveAndValidateAsset, revalidateListing, validateAsset, validateCircuitAsset, validateSignedListing } from "./chain/validation.js";
-import { accountParamsSchema, batchQuoteSchema, circuitCapacityParamsSchema, circuitCollectionParamsSchema, circuitListQuerySchema, circuitParamsSchema, circuitSummariesSchema, hashParamsSchema, listingCapacityParamsSchema, marketParamsSchema, marketSummariesSchema, quoteSchema, revalidateBatchSchema, signedListingSchema } from "./api/schemas.js";
+import { circuitCollectionAllowed, inspectListings, readBemBalance, readListingWalletBalance, resolveAndValidateAsset, revalidateListing, validateAsset, validateCircuitAsset, validateSignedListing } from "./chain/validation.js";
+import { accountParamsSchema, batchQuoteSchema, bemFillQuoteSchema, bemListQuerySchema, circuitCapacityParamsSchema, circuitCollectionParamsSchema, circuitListQuerySchema, circuitParamsSchema, circuitSummariesSchema, hashParamsSchema, listingCapacityParamsSchema, marketParamsSchema, marketSummariesSchema, quoteSchema, revalidateBatchSchema, signedListingSchema } from "./api/schemas.js";
+import { erc20Abi } from "./chain/contracts.js";
 
 export type AppDependencies = { config: AppConfig; repository: ListingRepository; chainClient: PublicClient };
 export async function buildApp({ config, repository, chainClient }: AppDependencies): Promise<FastifyInstance> {
@@ -36,7 +38,7 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
   });
   app.get("/health", { schema: { tags: ["health"] } }, async () => ({ ok: true }));
   app.get("/ready", { schema: { tags: ["health"] } }, async (_request, reply) => { try { await repository.ready(); return { ready: true, writeEnabled: config.writeEnabled }; } catch { return reply.status(503).send({ ready: false, writeEnabled: false }); } });
-  app.get("/api/v1/config", { schema: { tags: ["config"] } }, async () => ({ chainId: config.chainId, seaportAddress: config.seaportAddress, validatorAddress: config.validatorAddress, factoryAddress: config.factoryAddress, circuitCollections: config.circuitCollections, feeRecipient: config.feeRecipient, makerFeeBps: config.makerFeeBps, takerFeeBps: config.takerFeeBps, maxListingDurationSeconds: config.maxListingDurationSeconds, batchQuoteTtlSeconds: config.batchQuoteTtlSeconds, maxBatchOrders: config.maxBatchOrders, batchEnabled: config.batchEnabled, writeEnabled: config.writeEnabled }));
+  app.get("/api/v1/config", { schema: { tags: ["config"] } }, async () => ({ chainId: config.chainId, seaportAddress: config.seaportAddress, validatorAddress: config.validatorAddress, factoryAddress: config.factoryAddress, circuitCollections: config.circuitCollections, feeRecipient: config.feeRecipient, makerFeeBps: config.makerFeeBps, takerFeeBps: config.takerFeeBps, maxListingDurationSeconds: config.maxListingDurationSeconds, batchQuoteTtlSeconds: config.batchQuoteTtlSeconds, maxBatchOrders: config.maxBatchOrders, batchEnabled: config.batchEnabled, writeEnabled: config.writeEnabled, bemMarket: { enabled: config.bemOrderbookEnabled, chainId: config.chainId, bemToken: config.bemTokenAddress, usdtToken: config.usdtTokenAddress, pool: config.bemUsdtPoolAddress, orderbook: { makerFeeBps: 0, takerFeeBps: 100, sides: ["ASK"] } } }));
   app.post("/api/v1/listings/quote", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } }, schema: { tags: ["listings"] } }, async (request) => {
     if (!config.writeEnabled) throw new DomainError("WRITE_API_DISABLED", "FEE_RECIPIENT is not configured", 503);
     const body = quoteSchema.parse(request.body); const now = BigInt(Math.floor(Date.now() / 1000)); const end = BigInt(body.endTime);
@@ -48,6 +50,18 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
       if (capacity.availableToList !== "1") throw new DomainError("CIRCUIT_ALREADY_LISTED", "This Circuit already has an open listing", 409);
       return { assetStandard: "ERC721", processorAddress: body.processorAddress, collectionAddress: body.collectionAddress, transistorsAddress: null, tokenId: body.tokenId, endTime: body.endTime, ...quoteOrder(body.sellerUnitPriceWei, "1", BigInt(config.takerFeeBps)), feeRecipient: config.feeRecipient, makerFeeBps: String(config.makerFeeBps), takerFeeBps: String(config.takerFeeBps) };
     }
+    if (body.assetStandard === "ERC20") {
+      if (!config.bemOrderbookEnabled) throw new DomainError("BEM_MARKET_DISABLED", "BEM orderbook is disabled", 503);
+      const [baseDecimals, quoteDecimals, walletBalance] = await Promise.all([
+        chainClient.readContract({ address: config.bemTokenAddress as `0x${string}`, abi: erc20Abi, functionName: "decimals" }),
+        chainClient.readContract({ address: config.usdtTokenAddress as `0x${string}`, abi: erc20Abi, functionName: "decimals" }),
+        readBemBalance(chainClient, config, body.offerer),
+      ]);
+      const math = quoteBemAsk({ baseAmountAtomic: body.baseAmountAtomic, unitPriceQuoteAtomic: body.unitPriceQuoteAtomic, baseDecimals, quoteDecimals, takerFeeBps: BigInt(config.takerFeeBps) });
+      const capacity = repository.getBemListingCapacity ? await repository.getBemListingCapacity({ offerer: body.offerer, walletBalance, nowSeconds: now.toString() }) : { walletBalance, reservedListingQuantity: "0", availableToList: walletBalance, overcommittedQuantity: "0", reservingListingCount: 0 };
+      if (BigInt(body.baseAmountAtomic) > BigInt(capacity.availableToList)) throw new DomainError("BEM_LISTING_CAPACITY_EXCEEDED", "BEM listing exceeds available wallet balance", 409, capacity);
+      return { assetStandard: "ERC20", assetType: "BEM", marketPair: "BEM_USDT", orderSide: "ASK", baseToken: config.bemTokenAddress, quoteToken: config.usdtTokenAddress, baseDecimals, quoteDecimals, expiresAt: new Date(Number(end) * 1_000).toISOString(), endTime: body.endTime, ...math, feeRecipient: config.feeRecipient };
+    }
     await validateAsset(chainClient, config, body.processorAddress, body.transistorsAddress, body.tokenId);
     if (body.offerer) {
       const walletBalance = await readListingWalletBalance(chainClient, body.offerer, body.transistorsAddress, body.tokenId);
@@ -58,8 +72,8 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
   });
   app.post("/api/v1/listings", { config: { rateLimit: { max: 10, timeWindow: "1 minute", keyGenerator(request) { const offerer = (request.body as { parameters?: { offerer?: unknown } } | undefined)?.parameters?.offerer; return typeof offerer === "string" ? offerer.toLowerCase() : request.ip; } } }, schema: { tags: ["listings"] } }, async (request, reply) => {
     const body = signedListingSchema.parse(request.body); const hash = body.orderHash?.toLowerCase(); if (hash) { const existing = await repository.get(hash); if (existing) return existing; }
-    const listing = await validateSignedListing(chainClient, config, { assetStandard: body.assetStandard, processorAddress: body.processorAddress, ...(body.collectionAddress ? { collectionAddress: body.collectionAddress } : {}), parameters: body.parameters, signature: body.signature, ...(body.orderHash ? { orderHash: body.orderHash } : {}) }); const existing = await repository.get(listing.orderHash); if (existing) return existing;
-    const walletBalance = listing.assetStandard === "ERC721" ? "1" : await readListingWalletBalance(chainClient, listing.offerer, listing.transistorsAddress!, listing.tokenId);
+    const listing = await validateSignedListing(chainClient, config, { assetStandard: body.assetStandard, ...(body.assetStandard !== "ERC20" ? { processorAddress: body.processorAddress } : { marketPair: body.marketPair, orderSide: body.orderSide }), ...(body.collectionAddress ? { collectionAddress: body.collectionAddress } : {}), parameters: body.parameters, signature: body.signature, ...(body.orderHash ? { orderHash: body.orderHash } : {}) }); const existing = await repository.get(listing.orderHash); if (existing) return existing;
+    const walletBalance = listing.assetStandard === "ERC721" ? "1" : listing.assetStandard === "ERC20" ? await readBemBalance(chainClient, config, listing.offerer) : await readListingWalletBalance(chainClient, listing.offerer, listing.transistorsAddress!, listing.tokenId);
     const readCurrentOwner = listing.assetStandard === "ERC721" ? () => validateCircuitAsset(chainClient, config, listing.collectionAddress, listing.tokenId) : undefined;
     return reply.status(201).send(await repository.insertWithCapacityCheck({ listing, walletBalance, nowSeconds: String(Math.floor(Date.now() / 1_000)), ...(readCurrentOwner ? { readCurrentOwner } : {}) }));
   });
@@ -67,6 +81,44 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
   app.post("/api/v1/listings/:orderHash/revalidate", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } }, schema: { tags: ["listings"] } }, async (request) => {
     const { orderHash } = hashParamsSchema.parse(request.params); const listing = await repository.get(orderHash); if (!listing) throw new DomainError("NOT_FOUND", "Listing not found", 404);
     const patch = await revalidateListing(chainClient, config, listing); return (await repository.updateValidation(orderHash, patch))!;
+  });
+  app.post("/api/v1/bem/orderbook/quote", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } }, schema: { tags: ["bem"] } }, async (request) => {
+    if (!config.writeEnabled) throw new DomainError("WRITE_API_DISABLED", "FEE_RECIPIENT is not configured", 503);
+    if (!config.bemOrderbookEnabled) throw new DomainError("BEM_MARKET_DISABLED", "BEM orderbook is disabled", 503);
+    const body = quoteSchema.parse({ ...(request.body as object), assetStandard: "ERC20", assetType: "BEM", marketPair: "BEM_USDT", orderSide: "ASK" });
+    if (body.assetStandard !== "ERC20") throw new DomainError("INVALID_ERC20_ORDER", "Invalid BEM quote request");
+    const now = BigInt(Math.floor(Date.now() / 1_000)); const end = BigInt(body.endTime);
+    if (end <= now || end - now > BigInt(config.maxListingDurationSeconds)) throw new DomainError("ORDER_EXPIRED", "End time must be within the next 30 days");
+    const [baseDecimals, quoteDecimals, walletBalance] = await Promise.all([
+      chainClient.readContract({ address: config.bemTokenAddress as `0x${string}`, abi: erc20Abi, functionName: "decimals" }),
+      chainClient.readContract({ address: config.usdtTokenAddress as `0x${string}`, abi: erc20Abi, functionName: "decimals" }),
+      readBemBalance(chainClient, config, body.offerer),
+    ]);
+    const capacity = repository.getBemListingCapacity ? await repository.getBemListingCapacity({ offerer: body.offerer, walletBalance, nowSeconds: now.toString() }) : { walletBalance, reservedListingQuantity: "0", availableToList: walletBalance, overcommittedQuantity: "0", reservingListingCount: 0 };
+    if (BigInt(body.baseAmountAtomic) > BigInt(capacity.availableToList)) throw new DomainError("BEM_LISTING_CAPACITY_EXCEEDED", "BEM listing exceeds available wallet balance", 409, capacity);
+    return { assetStandard: "ERC20", assetType: "BEM", marketPair: "BEM_USDT", orderSide: "ASK", baseToken: config.bemTokenAddress, quoteToken: config.usdtTokenAddress, baseDecimals, quoteDecimals, expiresAt: new Date(Number(end) * 1_000).toISOString(), endTime: body.endTime, ...quoteBemAsk({ baseAmountAtomic: body.baseAmountAtomic, unitPriceQuoteAtomic: body.unitPriceQuoteAtomic, baseDecimals, quoteDecimals }), feeRecipient: config.feeRecipient };
+  });
+  app.get("/api/v1/bem/orderbook/listings", { schema: { tags: ["bem"] } }, async (request) => {
+    const query = bemListQuerySchema.parse(request.query);
+    if (repository.listBemPage) return repository.listBemPage({ statuses: ["ACTIVE", "PARTIALLY_FILLED", "STALE"], limit: query.limit, ...(query.cursor ? { cursor: query.cursor } : {}), sort: query.sort });
+    const rows = await repository.list({ assetStandard: "ERC20", statuses: ["ACTIVE", "PARTIALLY_FILLED", "STALE"], limit: query.limit }); return { listings: rows, nextCursor: null };
+  });
+  app.get("/api/v1/bem/orderbook/fills", { schema: { tags: ["bem"] } }, async () => ({ fills: repository.listBemFills ? await repository.listBemFills() : [] }));
+  app.get("/api/v1/bem/orderbook/summary", { schema: { tags: ["bem"] } }, async () => repository.bemSummary ? repository.bemSummary() : ({ bestAskQuoteAtomic: null, lastSaleQuoteAtomic: null, activeOrders: "0", openBemAtomic: "0", orderbookVolume24hQuoteAtomic: "0", generatedAt: new Date().toISOString() }));
+  app.post("/api/v1/bem/orderbook/fill-quote", { schema: { tags: ["bem"] } }, async (request) => {
+    const body = bemFillQuoteSchema.parse(request.body); const listing = await repository.get(body.orderHash);
+    if (!listing || listing.assetStandard !== "ERC20" || listing.marketPair !== "BEM_USDT" || !["ACTIVE", "PARTIALLY_FILLED"].includes(listing.status)) throw new DomainError("BEM_ORDER_NOT_ACTIVE", "BEM order is not active", 409);
+    if (listing.offerer.toLowerCase() === body.buyer.toLowerCase()) throw new DomainError("SELF_LISTING", "Seller cannot fill their own BEM order", 409);
+    const refreshed = await revalidateListing(chainClient, config, listing); await repository.updateValidation(listing.orderHash, refreshed);
+    if (!refreshed.status || !["ACTIVE", "PARTIALLY_FILLED"].includes(refreshed.status) || BigInt(body.baseAmountAtomic) > BigInt(refreshed.remainingQuantity ?? listing.remainingQuantity)) throw new DomainError("BEM_ORDER_NOT_ACTIVE", "BEM order remaining amount changed", 409, { remainingBaseAtomic: refreshed.remainingQuantity });
+    const fillStep = BigInt(listing.fillStepBaseAtomic ?? "0"); if (fillStep <= 0n || BigInt(body.baseAmountAtomic) % fillStep !== 0n) throw new DomainError("INEXACT_PARTIAL_FILL", "Requested BEM amount does not match fill step", 409, { fillStepBaseAtomic: listing.fillStepBaseAtomic });
+    return { orderHash: listing.orderHash, baseAmountAtomic: body.baseAmountAtomic, remainingBaseAtomic: refreshed.remainingQuantity, fillStepBaseAtomic: listing.fillStepBaseAtomic, ...quoteBemFill({ fillAmountAtomic: body.baseAmountAtomic, totalBaseAmountAtomic: listing.initialQuantity, sellerQuoteTotalAtomic: listing.sellerQuoteTotalAtomic!, feeQuoteTotalAtomic: listing.feeQuoteTotalAtomic! }) };
+  });
+  app.get("/api/v1/accounts/:address/bem-listings", { schema: { tags: ["accounts", "bem"] } }, async (request) => { const { address } = accountParamsSchema.parse(request.params); return { listings: await repository.list({ offerer: address, assetStandard: "ERC20", limit: 100 }) }; });
+  app.get("/api/v1/accounts/:address/bem-listing-capacity", { schema: { tags: ["accounts", "bem"] } }, async (request) => {
+    const { address } = accountParamsSchema.parse(request.params); const [walletBalanceAtomic, asOfBlock] = await Promise.all([readBemBalance(chainClient, config, address), chainClient.getBlockNumber().then(String)]);
+    const capacity = repository.getBemListingCapacity ? await repository.getBemListingCapacity({ offerer: address, walletBalance: walletBalanceAtomic }) : { walletBalance: walletBalanceAtomic, reservedListingQuantity: "0", availableToList: walletBalanceAtomic, overcommittedQuantity: "0", reservingListingCount: 0 };
+    return { address, assetStandard: "ERC20", assetType: "BEM", marketPair: "BEM_USDT", walletBalanceAtomic: capacity.walletBalance, reservedAtomic: capacity.reservedListingQuantity, availableAtomic: capacity.availableToList, overcommittedAtomic: capacity.overcommittedQuantity, reservingListingCount: capacity.reservingListingCount, asOfBlock, generatedAt: new Date().toISOString() };
   });
   app.get("/api/v1/markets/:transistorsAddress/:tokenId/listings", { schema: { tags: ["markets"] } }, async (request) => {
     const params = marketParamsSchema.parse(request.params); const query = request.query as Record<string, string | undefined>;
@@ -100,7 +152,7 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
       });
       if (preflightIssues.length) throw new DomainError("BATCH_PLAN_CHANGED", "One or more selected listings changed", 409, { issues: preflightIssues });
       const ordered = body.items.map((item) => byHash.get(item.orderHash.toLowerCase())!);
-      await validateAsset(chainClient, config, ordered[0]!.processorAddress, params.transistorsAddress, params.tokenId);
+      await validateAsset(chainClient, config, ordered[0]!.processorAddress!, params.transistorsAddress, params.tokenId);
       const inspections = await inspectListings(chainClient, config, ordered);
       await repository.revalidateMany(inspections.map((inspection) => ({ orderHash: inspection.listing.orderHash, patch: inspection.patch })));
       const issues = inspections.flatMap((inspection) => inspection.issueCode ? [{ orderHash: inspection.listing.orderHash, issueCode: inspection.issueCode }] : []);
@@ -117,7 +169,7 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
       if (best && BigInt(best.sellerUnitPriceWei) > BigInt(body.maxSellerUnitPriceWei)) throw new DomainError("MAX_PRICE_BELOW_BEST_ASK", "Maximum seller unit price is below the best ask", 409, { bestAskSellerUnitPriceWei: best.sellerUnitPriceWei });
       throw new DomainError("BATCH_EMPTY", "No fillable listings matched this sweep", 409);
     }
-    await validateAsset(chainClient, config, listings[0]!.processorAddress, params.transistorsAddress, params.tokenId);
+    await validateAsset(chainClient, config, listings[0]!.processorAddress!, params.transistorsAddress, params.tokenId);
     const inspections = await inspectListings(chainClient, config, listings);
     await repository.revalidateMany(inspections.map((inspection) => ({ orderHash: inspection.listing.orderHash, patch: inspection.patch })));
     const issueCounts = new Map<string, number>();

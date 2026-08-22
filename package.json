@@ -9,8 +9,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "dev:worker": "tsx watch src/worker.ts",
-    "start": "node dist/server.js",
-    "start:worker": "node dist/worker.js",
+    "start": "node dist/src/server.js",
+    "start:worker": "node dist/src/worker.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
