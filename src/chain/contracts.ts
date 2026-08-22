@@ -9,6 +9,16 @@ export const transistorsAbi = [
   { type: "function", name: "balanceOf", stateMutability: "view", inputs: [{ type: "address" }, { type: "uint256" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "isApprovedForAll", stateMutability: "view", inputs: [{ type: "address" }, { type: "address" }], outputs: [{ type: "bool" }] },
 ] as const;
+export const circuitAbi = [
+  { type: "function", name: "supportsInterface", stateMutability: "view", inputs: [{ type: "bytes4" }], outputs: [{ type: "bool" }] },
+  { type: "function", name: "name", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+  { type: "function", name: "symbol", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
+  { type: "function", name: "ownerOf", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "address" }] },
+  { type: "function", name: "getApproved", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "address" }] },
+  { type: "function", name: "isApprovedForAll", stateMutability: "view", inputs: [{ type: "address" }, { type: "address" }], outputs: [{ type: "bool" }] },
+  { type: "function", name: "circuitInfo", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "uint8" }, { type: "uint8" }, { type: "uint8" }, { type: "uint32" }] },
+  { type: "event", name: "Transfer", inputs: [{ indexed: true, name: "from", type: "address" }, { indexed: true, name: "to", type: "address" }, { indexed: true, name: "tokenId", type: "uint256" }] },
+] as const;
 export const seaportAbi = [
   { type: "function", name: "getCounter", stateMutability: "view", inputs: [{ type: "address" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "getOrderStatus", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "bool", name: "isValidated" }, { type: "bool", name: "isCancelled" }, { type: "uint256", name: "totalFilled" }, { type: "uint256", name: "totalSize" }] },

@@ -26,7 +26,7 @@ describe("Seaport batch event indexing", () => {
     const config = loadConfig({ NODE_ENV: "test", DATABASE_URL: "postgresql://unused", BSC_RPC_HTTP_URL: "http://localhost:8545", FEE_RECIPIENT: "0x3333333333333333333333333333333333333333", SEAPORT_INDEX_START_BLOCK: "101", CHAIN_CONFIRMATIONS: "0", CHAIN_STARTUP_CHECK: "false" });
     expect(await syncSeaportEvents(pool, client, config)).toBe(2);
     expect(inserted).toEqual(new Set([`${txHash}:7`, `${txHash}:8`]));
-    expect(insertValues.map((values) => ({ sellerProceeds: values[13], fee: values[14], buyerTotal: values[15] }))).toEqual([{ sellerProceeds: "20000", fee: "200", buyerTotal: "20200" }, { sellerProceeds: "60000", fee: "600", buyerTotal: "60600" }]);
+    expect(insertValues.map((values) => ({ sellerProceeds: values[15], fee: values[16], buyerTotal: values[17] }))).toEqual([{ sellerProceeds: "20000", fee: "200", buyerTotal: "20200" }, { sellerProceeds: "60000", fee: "600", buyerTotal: "60600" }]);
     expect(remainingUpdates).toEqual([[orderA, "2"], [orderB, "3"]]);
     expect(await syncSeaportEvents(pool, client, config)).toBe(0);
     expect(insertValues).toHaveLength(2); expect(remainingUpdates).toHaveLength(2);

@@ -68,11 +68,12 @@ const byPriceAndHash = (a: BatchCandidate, b: BatchCandidate) => {
 };
 
 function sellerKey(listing: ListingRecord) {
+  if (listing.assetStandard !== "ERC1155" || !listing.transistorsAddress) throw new DomainError("INVALID_ASSET_STANDARD", "Batch quotes only support ERC-1155 listings");
   return `${listing.offerer.toLowerCase()}:${listing.transistorsAddress.toLowerCase()}:${listing.tokenId}`;
 }
 
 function isCandidateFillable(listing: ListingRecord, buyer: string, now: Date) {
-  return (listing.status === "ACTIVE" || listing.status === "PARTIALLY_FILLED") && BigInt(listing.remainingQuantity) > 0n && BigInt(listing.endTime) > BigInt(Math.floor(now.getTime() / 1_000)) && listing.offerer.toLowerCase() !== buyer.toLowerCase();
+  return listing.assetStandard === "ERC1155" && (listing.status === "ACTIVE" || listing.status === "PARTIALLY_FILLED") && BigInt(listing.remainingQuantity) > 0n && BigInt(listing.endTime) > BigInt(Math.floor(now.getTime() / 1_000)) && listing.offerer.toLowerCase() !== buyer.toLowerCase();
 }
 
 function makeItem(listing: ListingRecord, units: bigint): BatchPlanItem {

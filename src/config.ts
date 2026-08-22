@@ -9,6 +9,11 @@ export const CANONICAL = {
   seaport: "0x0000000000000068F116a894984e2DB1123eB395",
   validator: "0x00e5F120f500006757E984F1DED400fc00370000",
   conduitController: "0x00000000F9490004C11Cef243f5400493c00Ad63",
+  circuitCollections: {
+    tapeout: "0xb1024b89886B9a34Aa4ff5F31C411D708b20a14C",
+    behemoth: "0x1F5Cb4aeaE1807Bf60c3b9C0D8aDBCC14e91f12C",
+  },
+  podMining: "0x7E2E0DC66a3bD9103E69b766afA62d9f7b697b46",
 } as const;
 
 const envSchema = z.object({
@@ -41,6 +46,7 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env) {
     nodeEnv: env.NODE_ENV, port: env.PORT, databaseUrl: env.DATABASE_URL, rpcUrls: [env.BSC_RPC_HTTP_URL, ...env.BSC_RPC_FALLBACK_URLS.split(",").map((v) => v.trim()).filter(Boolean)],
     chainId: env.CHAIN_ID, factoryAddress: getAddress(env.FACTORY_ADDRESS), legacyMarketplaceAddress: getAddress(env.LEGACY_MARKETPLACE_ADDRESS),
     seaportAddress: getAddress(env.SEAPORT_ADDRESS), validatorAddress: getAddress(env.SEAPORT_VALIDATOR_ADDRESS), conduitControllerAddress: getAddress(env.CONDUIT_CONTROLLER_ADDRESS),
+    circuitCollections: Object.values(CANONICAL.circuitCollections).map(getAddress), podMiningAddress: getAddress(CANONICAL.podMining),
     feeRecipient: writeEnabled ? getAddress(env.FEE_RECIPIENT) : null, makerFeeBps: env.MAKER_FEE_BPS, takerFeeBps: env.TAKER_FEE_BPS,
     factoryStartBlock: env.FACTORY_START_BLOCK, seaportIndexStartBlock: env.SEAPORT_INDEX_START_BLOCK ? BigInt(env.SEAPORT_INDEX_START_BLOCK) : null,
     confirmations: env.CHAIN_CONFIRMATIONS, revalidationSeconds: env.LISTING_REVALIDATION_SECONDS, staleSeconds: env.LISTING_STALE_SECONDS,

@@ -4,18 +4,29 @@ const decimal = z.string().regex(/^\d+$/);
 const decimalOrNumber = z.union([decimal, z.number().int().nonnegative().safe()]).transform(String);
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 const bytes32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/);
-export const quoteSchema = z.object({ processorAddress: address, transistorsAddress: address, tokenId: z.enum(["0", "1"]), sellerUnitPriceWei: decimal, quantity: decimal, endTime: decimal, offerer: address.optional() });
+const erc1155QuoteSchema = z.object({ assetStandard: z.literal("ERC1155"), processorAddress: address, transistorsAddress: address, collectionAddress: address.optional(), tokenId: z.enum(["0", "1"]), sellerUnitPriceWei: decimal, quantity: decimal, endTime: decimal, offerer: address.optional() });
+const circuitQuoteSchema = z.object({ assetStandard: z.literal("ERC721"), processorAddress: address, collectionAddress: address, tokenId: decimal, sellerUnitPriceWei: decimal, endTime: decimal, offerer: address });
+export const quoteSchema = z.preprocess((value) => value && typeof value === "object" && !("assetStandard" in value) ? { ...value, assetStandard: "ERC1155" } : value, z.discriminatedUnion("assetStandard", [erc1155QuoteSchema, circuitQuoteSchema]));
 const offerItem = z.object({ itemType: z.number().int(), token: address, identifierOrCriteria: decimal, startAmount: decimal, endAmount: decimal });
 const considerationItem = offerItem.extend({ recipient: address });
-export const signedListingSchema = z.object({
-  processorAddress: address, orderHash: bytes32.optional(), signature: z.string().regex(/^0x[0-9a-fA-F]+$/),
+const signedListingBase = z.object({
+  processorAddress: address, collectionAddress: address.optional(), orderHash: bytes32.optional(), signature: z.string().regex(/^0x[0-9a-fA-F]+$/),
   parameters: z.object({ offerer: address, zone: address, offer: z.array(offerItem), consideration: z.array(considerationItem), orderType: z.number().int(), startTime: decimal, endTime: decimal, zoneHash: bytes32, salt: decimal.or(bytes32), conduitKey: bytes32, totalOriginalConsiderationItems: decimalOrNumber, counter: decimal }),
 });
+export const signedListingSchema = z.preprocess((value) => value && typeof value === "object" && !("assetStandard" in value) ? { ...value, assetStandard: "ERC1155" } : value, z.discriminatedUnion("assetStandard", [
+  signedListingBase.extend({ assetStandard: z.literal("ERC1155") }),
+  signedListingBase.extend({ assetStandard: z.literal("ERC721"), collectionAddress: address }),
+]));
 export const hashParamsSchema = z.object({ orderHash: bytes32 });
 export const marketParamsSchema = z.object({ transistorsAddress: address, tokenId: z.enum(["0", "1"] ) });
 export const accountParamsSchema = z.object({ address });
 export const listingCapacityParamsSchema = z.object({ address, transistorsAddress: address, tokenId: z.enum(["0", "1"]) });
 export const marketSummariesSchema = z.object({ markets: z.array(z.object({ transistorsAddress: address, tokenId: z.enum(["0", "1"]) })).min(1).max(50) });
+export const circuitCollectionParamsSchema = z.object({ collectionAddress: address });
+export const circuitParamsSchema = z.object({ collectionAddress: address, tokenId: decimal });
+export const circuitCapacityParamsSchema = z.object({ address, collectionAddress: address, tokenId: decimal });
+export const circuitSummariesSchema = z.object({ collections: z.array(address).min(1).max(2) });
+export const circuitListQuerySchema = z.object({ cursor: z.string().min(1).optional(), sort: z.enum(["price_asc", "newest"]).default("price_asc"), limit: z.coerce.number().int().min(1).max(100).default(24) });
 
 const selectedBatchSchema = z.object({
   mode: z.literal("SELECTED"), buyer: address,

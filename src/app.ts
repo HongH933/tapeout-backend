@@ -11,8 +11,8 @@ import { DomainError } from "./domain/errors.js";
 import { assertListingCapacity } from "./domain/listing-capacity.js";
 import { quoteOrder } from "./domain/order-math.js";
 import { assertBatchQuoteExpectation, buildSelectedBatchQuote, buildSweepBatchQuote, type BatchCandidate } from "./domain/batch-quote.js";
-import { inspectListings, readListingWalletBalance, resolveAndValidateAsset, revalidateListing, validateAsset, validateSignedListing } from "./chain/validation.js";
-import { accountParamsSchema, batchQuoteSchema, hashParamsSchema, listingCapacityParamsSchema, marketParamsSchema, marketSummariesSchema, quoteSchema, revalidateBatchSchema, signedListingSchema } from "./api/schemas.js";
+import { circuitCollectionAllowed, inspectListings, readListingWalletBalance, resolveAndValidateAsset, revalidateListing, validateAsset, validateCircuitAsset, validateSignedListing } from "./chain/validation.js";
+import { accountParamsSchema, batchQuoteSchema, circuitCapacityParamsSchema, circuitCollectionParamsSchema, circuitListQuerySchema, circuitParamsSchema, circuitSummariesSchema, hashParamsSchema, listingCapacityParamsSchema, marketParamsSchema, marketSummariesSchema, quoteSchema, revalidateBatchSchema, signedListingSchema } from "./api/schemas.js";
 
 export type AppDependencies = { config: AppConfig; repository: ListingRepository; chainClient: PublicClient };
 export async function buildApp({ config, repository, chainClient }: AppDependencies): Promise<FastifyInstance> {
@@ -36,24 +36,32 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
   });
   app.get("/health", { schema: { tags: ["health"] } }, async () => ({ ok: true }));
   app.get("/ready", { schema: { tags: ["health"] } }, async (_request, reply) => { try { await repository.ready(); return { ready: true, writeEnabled: config.writeEnabled }; } catch { return reply.status(503).send({ ready: false, writeEnabled: false }); } });
-  app.get("/api/v1/config", { schema: { tags: ["config"] } }, async () => ({ chainId: config.chainId, seaportAddress: config.seaportAddress, validatorAddress: config.validatorAddress, factoryAddress: config.factoryAddress, feeRecipient: config.feeRecipient, makerFeeBps: config.makerFeeBps, takerFeeBps: config.takerFeeBps, maxListingDurationSeconds: config.maxListingDurationSeconds, batchQuoteTtlSeconds: config.batchQuoteTtlSeconds, maxBatchOrders: config.maxBatchOrders, batchEnabled: config.batchEnabled, writeEnabled: config.writeEnabled }));
+  app.get("/api/v1/config", { schema: { tags: ["config"] } }, async () => ({ chainId: config.chainId, seaportAddress: config.seaportAddress, validatorAddress: config.validatorAddress, factoryAddress: config.factoryAddress, circuitCollections: config.circuitCollections, feeRecipient: config.feeRecipient, makerFeeBps: config.makerFeeBps, takerFeeBps: config.takerFeeBps, maxListingDurationSeconds: config.maxListingDurationSeconds, batchQuoteTtlSeconds: config.batchQuoteTtlSeconds, maxBatchOrders: config.maxBatchOrders, batchEnabled: config.batchEnabled, writeEnabled: config.writeEnabled }));
   app.post("/api/v1/listings/quote", { config: { rateLimit: { max: 30, timeWindow: "1 minute" } }, schema: { tags: ["listings"] } }, async (request) => {
     if (!config.writeEnabled) throw new DomainError("WRITE_API_DISABLED", "FEE_RECIPIENT is not configured", 503);
     const body = quoteSchema.parse(request.body); const now = BigInt(Math.floor(Date.now() / 1000)); const end = BigInt(body.endTime);
     if (end <= now || end - now > BigInt(config.maxListingDurationSeconds)) throw new DomainError("ORDER_EXPIRED", "End time must be within the next 30 days");
+    if (body.assetStandard === "ERC721") {
+      const owner = await validateCircuitAsset(chainClient, config, body.collectionAddress, body.tokenId);
+      if (owner.toLowerCase() !== body.offerer.toLowerCase()) throw new DomainError("CIRCUIT_NOT_OWNER", "This wallet is no longer the owner", 409);
+      const capacity = await repository.getCircuitListingCapacity({ offerer: body.offerer, collectionAddress: body.collectionAddress, tokenId: body.tokenId, currentOwner: owner, nowSeconds: now.toString() });
+      if (capacity.availableToList !== "1") throw new DomainError("CIRCUIT_ALREADY_LISTED", "This Circuit already has an open listing", 409);
+      return { assetStandard: "ERC721", processorAddress: body.processorAddress, collectionAddress: body.collectionAddress, transistorsAddress: null, tokenId: body.tokenId, endTime: body.endTime, ...quoteOrder(body.sellerUnitPriceWei, "1", BigInt(config.takerFeeBps)), feeRecipient: config.feeRecipient, makerFeeBps: String(config.makerFeeBps), takerFeeBps: String(config.takerFeeBps) };
+    }
     await validateAsset(chainClient, config, body.processorAddress, body.transistorsAddress, body.tokenId);
     if (body.offerer) {
       const walletBalance = await readListingWalletBalance(chainClient, body.offerer, body.transistorsAddress, body.tokenId);
       const capacity = await repository.getListingCapacity({ offerer: body.offerer, transistorsAddress: body.transistorsAddress, tokenId: body.tokenId, walletBalance, nowSeconds: now.toString() });
       assertListingCapacity(capacity, body.quantity, body.tokenId === "0" ? "NAND" : "LATCH");
     }
-    return { processorAddress: body.processorAddress, transistorsAddress: body.transistorsAddress, tokenId: body.tokenId, endTime: body.endTime, ...quoteOrder(body.sellerUnitPriceWei, body.quantity, BigInt(config.takerFeeBps)), feeRecipient: config.feeRecipient, makerFeeBps: String(config.makerFeeBps), takerFeeBps: String(config.takerFeeBps) };
+    return { assetStandard: "ERC1155", processorAddress: body.processorAddress, collectionAddress: body.collectionAddress ?? body.transistorsAddress, transistorsAddress: body.transistorsAddress, tokenId: body.tokenId, endTime: body.endTime, ...quoteOrder(body.sellerUnitPriceWei, body.quantity, BigInt(config.takerFeeBps)), feeRecipient: config.feeRecipient, makerFeeBps: String(config.makerFeeBps), takerFeeBps: String(config.takerFeeBps) };
   });
   app.post("/api/v1/listings", { config: { rateLimit: { max: 10, timeWindow: "1 minute", keyGenerator(request) { const offerer = (request.body as { parameters?: { offerer?: unknown } } | undefined)?.parameters?.offerer; return typeof offerer === "string" ? offerer.toLowerCase() : request.ip; } } }, schema: { tags: ["listings"] } }, async (request, reply) => {
     const body = signedListingSchema.parse(request.body); const hash = body.orderHash?.toLowerCase(); if (hash) { const existing = await repository.get(hash); if (existing) return existing; }
-    const listing = await validateSignedListing(chainClient, config, { processorAddress: body.processorAddress, parameters: body.parameters, signature: body.signature, ...(body.orderHash ? { orderHash: body.orderHash } : {}) }); const existing = await repository.get(listing.orderHash); if (existing) return existing;
-    const walletBalance = await readListingWalletBalance(chainClient, listing.offerer, listing.transistorsAddress, listing.tokenId);
-    return reply.status(201).send(await repository.insertWithCapacityCheck({ listing, walletBalance, nowSeconds: String(Math.floor(Date.now() / 1_000)) }));
+    const listing = await validateSignedListing(chainClient, config, { assetStandard: body.assetStandard, processorAddress: body.processorAddress, ...(body.collectionAddress ? { collectionAddress: body.collectionAddress } : {}), parameters: body.parameters, signature: body.signature, ...(body.orderHash ? { orderHash: body.orderHash } : {}) }); const existing = await repository.get(listing.orderHash); if (existing) return existing;
+    const walletBalance = listing.assetStandard === "ERC721" ? "1" : await readListingWalletBalance(chainClient, listing.offerer, listing.transistorsAddress!, listing.tokenId);
+    const readCurrentOwner = listing.assetStandard === "ERC721" ? () => validateCircuitAsset(chainClient, config, listing.collectionAddress, listing.tokenId) : undefined;
+    return reply.status(201).send(await repository.insertWithCapacityCheck({ listing, walletBalance, nowSeconds: String(Math.floor(Date.now() / 1_000)), ...(readCurrentOwner ? { readCurrentOwner } : {}) }));
   });
   app.get("/api/v1/listings/:orderHash", { schema: { tags: ["listings"] } }, async (request) => { const { orderHash } = hashParamsSchema.parse(request.params); const result = await repository.get(orderHash); if (!result) throw new DomainError("NOT_FOUND", "Listing not found", 404); return result; });
   app.post("/api/v1/listings/:orderHash/revalidate", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } }, schema: { tags: ["listings"] } }, async (request) => {
@@ -86,7 +94,7 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
       const preflightIssues = body.items.flatMap((item) => {
         const listing = byHash.get(item.orderHash.toLowerCase());
         if (!listing) return [{ orderHash: item.orderHash, issueCode: "LISTING_NOT_FOUND" }];
-        if (listing.transistorsAddress.toLowerCase() !== params.transistorsAddress.toLowerCase() || listing.tokenId !== params.tokenId) return [{ orderHash: item.orderHash, issueCode: "LISTING_NOT_FOUND" }];
+        if (listing.assetStandard !== "ERC1155" || listing.transistorsAddress?.toLowerCase() !== params.transistorsAddress.toLowerCase() || listing.tokenId !== params.tokenId) return [{ orderHash: item.orderHash, issueCode: "LISTING_NOT_FOUND" }];
         if (listing.offerer.toLowerCase() === body.buyer.toLowerCase()) return [{ orderHash: item.orderHash, issueCode: "SELF_LISTING" }];
         return [];
       });
@@ -146,6 +154,46 @@ export async function buildApp({ config, repository, chainClient }: AppDependenc
     const markets = body.markets.filter((market) => { const key = `${market.transistorsAddress.toLowerCase()}:${market.tokenId}`; if (seen.has(key)) return false; seen.add(key); return true; });
     await Promise.all(markets.map((market) => resolveAndValidateAsset(chainClient, config, market.transistorsAddress, market.tokenId)));
     return repository.summaries(markets);
+  });
+  const assertCircuitCollection = (collectionAddress: string) => {
+    if (!circuitCollectionAllowed(config, collectionAddress)) throw new DomainError("CIRCUIT_COLLECTION_NOT_ALLOWED", "Circuit collection is not supported", 404);
+  };
+  app.get("/api/v1/circuit-collections/:collectionAddress/listings", { schema: { tags: ["circuits"] } }, async (request) => {
+    const { collectionAddress } = circuitCollectionParamsSchema.parse(request.params); assertCircuitCollection(collectionAddress);
+    const query = circuitListQuerySchema.parse(request.query);
+    const page = await repository.listCircuitPage({ collectionAddress, statuses: ["ACTIVE"], limit: query.limit, ...(query.cursor ? { cursor: query.cursor } : {}), sort: query.sort });
+    return page;
+  });
+  app.get("/api/v1/circuit-collections/:collectionAddress/fills", { schema: { tags: ["circuits"] } }, async (request) => {
+    const { collectionAddress } = circuitCollectionParamsSchema.parse(request.params); assertCircuitCollection(collectionAddress);
+    return { fills: await repository.listCircuitFills(collectionAddress) };
+  });
+  app.get("/api/v1/circuit-collections/:collectionAddress/summary", { schema: { tags: ["circuits"] } }, async (request) => {
+    const { collectionAddress } = circuitCollectionParamsSchema.parse(request.params); assertCircuitCollection(collectionAddress);
+    const result = await repository.circuitSummaries([collectionAddress]); return { ...result.summaries[0], generatedAt: result.generatedAt, lastIndexedBlock: result.lastIndexedBlock, indexerStale: result.indexerStale };
+  });
+  app.post("/api/v1/circuit-collections/summaries", { schema: { tags: ["circuits"] } }, async (request) => {
+    const body = circuitSummariesSchema.parse(request.body); const collections = [...new Set(body.collections.map((value) => value.toLowerCase()))];
+    collections.forEach(assertCircuitCollection); return repository.circuitSummaries(collections);
+  });
+  app.get("/api/v1/circuits/:collectionAddress/:tokenId/listings", { schema: { tags: ["circuits"] } }, async (request) => {
+    const params = circuitParamsSchema.parse(request.params); assertCircuitCollection(params.collectionAddress);
+    return repository.listCircuitPage({ collectionAddress: params.collectionAddress, tokenId: params.tokenId, statuses: ["ACTIVE", "STALE"], limit: 20, sort: "price_asc" });
+  });
+  app.get("/api/v1/circuits/:collectionAddress/:tokenId/fills", { schema: { tags: ["circuits"] } }, async (request) => {
+    const params = circuitParamsSchema.parse(request.params); assertCircuitCollection(params.collectionAddress);
+    return { fills: await repository.listCircuitFills(params.collectionAddress, params.tokenId) };
+  });
+  app.get("/api/v1/accounts/:address/circuit-listings", { schema: { tags: ["accounts", "circuits"] } }, async (request) => {
+    const { address } = accountParamsSchema.parse(request.params); return { listings: await repository.list({ offerer: address, assetStandard: "ERC721", limit: 100 }) };
+  });
+  app.get("/api/v1/accounts/:address/circuits/:collectionAddress/:tokenId/listing-capacity", { schema: { tags: ["accounts", "circuits"] } }, async (request) => {
+    const params = circuitCapacityParamsSchema.parse(request.params); const owner = await validateCircuitAsset(chainClient, config, params.collectionAddress, params.tokenId);
+    const [capacity, asOfBlock] = await Promise.all([
+      repository.getCircuitListingCapacity({ offerer: params.address, collectionAddress: params.collectionAddress, tokenId: params.tokenId, currentOwner: owner }),
+      chainClient.getBlockNumber().then(String),
+    ]);
+    return { address: params.address, assetStandard: "ERC721", collectionAddress: params.collectionAddress, transistorsAddress: null, tokenId: params.tokenId, assetType: "CIRCUIT", ...capacity, asOfBlock, generatedAt: new Date().toISOString() };
   });
   app.addHook("onClose", async () => repository.close());
   return app;

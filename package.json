@@ -16,7 +16,8 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:fork": "vitest run tests/fork",
-    "db:migrate": "tsx src/db/migrate.ts"
+    "db:migrate": "tsx src/db/migrate.ts",
+    "verify:chain": "node --import tsx scripts/verify-chain.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.1.0",

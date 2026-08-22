@@ -18,7 +18,7 @@ function listing(id: number, price = 10_000n, remaining = 10n, seller = sellerA,
   const fee = price / 100n; const timestamp = now.toISOString(); const endTime = String(Math.floor(now.getTime() / 1_000) + 3_600);
   return {
     orderHash: hash(id), chainId: 56, seaportAddress: "0x0000000000000068F116a894984e2DB1123eB395", offerer: seller,
-    processorAddress: processor, transistorsAddress: token, tokenId: "0", assetType: "NAND", initialQuantity: remaining.toString(), remainingQuantity: remaining.toString(),
+    processorAddress: processor, assetStandard: "ERC1155", collectionAddress: token, transistorsAddress: token, tokenId: "0", assetType: "NAND", initialQuantity: remaining.toString(), remainingQuantity: remaining.toString(),
     sellerUnitPriceWei: price.toString(), takerFeePerUnitWei: fee.toString(), buyerUnitTotalWei: (price + fee).toString(),
     sellerTotalWei: (price * remaining).toString(), feeTotalWei: (fee * remaining).toString(), buyerTotalWei: ((price + fee) * remaining).toString(),
     parameters: { offerer: seller, zone: ZeroAddress, offer: [{ itemType: 3, token, identifierOrCriteria: "0", startAmount: remaining.toString(), endAmount: remaining.toString() }], consideration: [{ itemType: 0, token: ZeroAddress, identifierOrCriteria: "0", startAmount: (price * remaining).toString(), endAmount: (price * remaining).toString(), recipient: seller }, { itemType: 0, token: ZeroAddress, identifierOrCriteria: "0", startAmount: (fee * remaining).toString(), endAmount: (fee * remaining).toString(), recipient: feeRecipient }], orderType: 1, startTime: "1", endTime, zoneHash: ZeroHash, salt: String(id), conduitKey: ZeroHash, totalOriginalConsiderationItems: "2", counter: "0" },
