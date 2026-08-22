@@ -13,7 +13,7 @@ export type ErrorCode =
   | "INSUFFICIENT_SAFE_BALANCE" | "BATCH_SIMULATION_FAILED" | "BATCH_ACTION_UNEXPECTED"
   | "CIRCUIT_COLLECTION_NOT_ALLOWED" | "CIRCUIT_NOT_FOUND" | "CIRCUIT_NOT_OWNER"
   | "CIRCUIT_ALREADY_LISTED" | "ERC721_APPROVAL_MISSING" | "ERC721_PARTIAL_FILL_FORBIDDEN"
-  | "INVALID_ASSET_STANDARD" | "INVALID_ORDER_TYPE" | "INVALID_OWNER";
+  | "INVALID_ASSET_STANDARD" | "INVALID_ORDER_TYPE" | "INVALID_OWNER" | "INVALID_CURSOR";
 
 export class DomainError extends Error {
   constructor(public readonly code: ErrorCode, message: string, public readonly statusCode = 400, public readonly details?: unknown) {

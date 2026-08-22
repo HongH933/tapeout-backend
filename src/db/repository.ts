@@ -1,4 +1,5 @@
 import type { ListingRecord, ListingStatus } from "../domain/listing.js";
+import { DomainError } from "../domain/errors.js";
 
 export type ListingQuery = { assetStandard?: "ERC1155" | "ERC721"; collectionAddress?: string; transistorsAddress?: string; tokenId?: string; offerer?: string; statuses?: ListingStatus[]; limit?: number; cursor?: string };
 export type ListingValidationPatch = Partial<Pick<ListingRecord, "status" | "remainingQuantity" | "validationState" | "validationDetails" | "validatorCodes" | "lastValidatedAt" | "updatedAt">>;
@@ -26,8 +27,8 @@ export function decodeMarketCursor(value: string): MarketCursor {
     const candidate = parsed as Record<string, unknown>;
     if (typeof candidate.sellerUnitPriceWei !== "string" || !/^\d+$/.test(candidate.sellerUnitPriceWei) || typeof candidate.orderHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(candidate.orderHash)) throw new Error("Invalid cursor");
     return { sellerUnitPriceWei: candidate.sellerUnitPriceWei, orderHash: candidate.orderHash.toLowerCase() };
-  } catch (error) {
-    throw new Error("INVALID_CURSOR", { cause: error });
+  } catch {
+    throw new DomainError("INVALID_CURSOR", "INVALID_CURSOR", 400);
   }
 }
 export type FillRecord = { orderHash: string; txHash: string; logIndex: number; blockNumber: string; blockTimestamp: string; seller: string; buyer: string; assetStandard: "ERC1155" | "ERC721"; collectionAddress: string; transistorsAddress: string | null; tokenId: string; quantity: string; sellerUnitPriceWei: string; sellerProceedsWei: string; takerFeeWei: string; buyerTotalWei: string; source: "SEAPORT_LISTING_SALE" };

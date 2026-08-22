@@ -1,0 +1,18 @@
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env before production deployment}
+
+  migrate:
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env before production deployment}@postgres:5432/tapemarket
+
+  api:
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env before production deployment}@postgres:5432/tapemarket
+    ports: !override
+      - "127.0.0.1:18080:8080"
+
+  worker:
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env before production deployment}@postgres:5432/tapemarket

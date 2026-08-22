@@ -18,7 +18,8 @@ export const CANONICAL = {
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"), PORT: z.coerce.number().int().positive().default(8080),
-  DATABASE_URL: z.string().min(1), BSC_RPC_HTTP_URL: z.string().url(), BSC_RPC_FALLBACK_URLS: z.string().default(""),
+  DATABASE_URL: z.string().min(1), BSC_RPC_HTTP_URL: z.string().url(), BSC_RPC_FALLBACK_URLS: z.string().default(""), BSC_LOG_RPC_HTTP_URL: z.union([z.literal(""), z.string().url()]).default(""),
+  LOG_SCAN_BLOCK_RANGE: z.coerce.number().int().min(1).max(2_000).default(2_000),
   CHAIN_ID: z.coerce.number().int().default(56), FACTORY_ADDRESS: z.string().default(CANONICAL.factory),
   LEGACY_MARKETPLACE_ADDRESS: z.string().default(CANONICAL.legacyMarketplace), SEAPORT_ADDRESS: z.string().default(CANONICAL.seaport),
   SEAPORT_VALIDATOR_ADDRESS: z.string().default(CANONICAL.validator), CONDUIT_CONTROLLER_ADDRESS: z.string().default(CANONICAL.conduitController),
@@ -43,7 +44,7 @@ export function loadConfig(input: NodeJS.ProcessEnv = process.env) {
   if (env.MAKER_FEE_BPS !== 0 || env.TAKER_FEE_BPS !== 100) throw new Error("Fees must be Maker 0 BPS / Taker 100 BPS");
   const writeEnabled = isAddress(env.FEE_RECIPIENT) && getAddress(env.FEE_RECIPIENT) !== "0x0000000000000000000000000000000000000000";
   return {
-    nodeEnv: env.NODE_ENV, port: env.PORT, databaseUrl: env.DATABASE_URL, rpcUrls: [env.BSC_RPC_HTTP_URL, ...env.BSC_RPC_FALLBACK_URLS.split(",").map((v) => v.trim()).filter(Boolean)],
+    nodeEnv: env.NODE_ENV, port: env.PORT, databaseUrl: env.DATABASE_URL, rpcUrls: [env.BSC_RPC_HTTP_URL, ...env.BSC_RPC_FALLBACK_URLS.split(",").map((v) => v.trim()).filter(Boolean)], logRpcUrl: env.BSC_LOG_RPC_HTTP_URL || null, logScanBlockRange: env.LOG_SCAN_BLOCK_RANGE,
     chainId: env.CHAIN_ID, factoryAddress: getAddress(env.FACTORY_ADDRESS), legacyMarketplaceAddress: getAddress(env.LEGACY_MARKETPLACE_ADDRESS),
     seaportAddress: getAddress(env.SEAPORT_ADDRESS), validatorAddress: getAddress(env.SEAPORT_VALIDATOR_ADDRESS), conduitControllerAddress: getAddress(env.CONDUIT_CONTROLLER_ADDRESS),
     circuitCollections: Object.values(CANONICAL.circuitCollections).map(getAddress), podMiningAddress: getAddress(CANONICAL.podMining),

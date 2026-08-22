@@ -126,9 +126,15 @@ export class PostgresListingRepository implements ListingRepository {
     const values: unknown[] = [input.collectionAddress.toLowerCase(), input.statuses ?? ["ACTIVE"]];
     if (input.tokenId !== undefined) { values.push(input.tokenId); clauses.push(`token_id=$${values.length}`); }
     if (input.cursor) {
-      let cursor: { sort: "price_asc" | "newest"; value: string; orderHash: string };
-      try { cursor = JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8")); } catch { throw new Error("INVALID_CURSOR"); }
-      if (cursor.sort !== (input.sort ?? "price_asc") || !cursor.value || !/^0x[0-9a-fA-F]{64}$/.test(cursor.orderHash)) throw new Error("INVALID_CURSOR");
+      let cursor: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(Buffer.from(input.cursor, "base64url").toString("utf8"));
+        if (!parsed || typeof parsed !== "object") throw new Error("Invalid cursor shape");
+        cursor = parsed as Record<string, unknown>;
+      } catch { throw new DomainError("INVALID_CURSOR", "Invalid pagination cursor", 400); }
+      const expectedSort = input.sort ?? "price_asc";
+      const validValue = typeof cursor.value === "string" && (expectedSort === "newest" ? !Number.isNaN(Date.parse(cursor.value)) : /^\d+$/.test(cursor.value));
+      if (cursor.sort !== expectedSort || !validValue || typeof cursor.orderHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(cursor.orderHash)) throw new DomainError("INVALID_CURSOR", "Invalid pagination cursor", 400);
       values.push(cursor.value, cursor.orderHash.toLowerCase()); const valueIndex = values.length - 1; const hashIndex = values.length;
       clauses.push(input.sort === "newest" ? `(created_at<$${valueIndex} OR (created_at=$${valueIndex} AND order_hash>$${hashIndex}))` : `(seller_unit_price_wei>$${valueIndex} OR (seller_unit_price_wei=$${valueIndex} AND order_hash>$${hashIndex}))`);
     }

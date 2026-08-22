@@ -2,14 +2,14 @@ import type pg from "pg";
 import type { PublicClient } from "viem";
 import type { AppConfig } from "../config.js";
 import { factoryAbi } from "../chain/contracts.js";
+import { blockRanges } from "./block-ranges.js";
 
 export async function syncFactory(pool: pg.Pool, client: PublicClient, config: AppConfig) {
   const checkpoint = await pool.query("SELECT block_number FROM sync_checkpoints WHERE stream='factory'");
   const from = checkpoint.rows[0] ? BigInt(checkpoint.rows[0].block_number) + 1n : config.factoryStartBlock;
   const latest = await client.getBlockNumber() - BigInt(config.confirmations); if (from > latest) return 0;
   let count = 0;
-  for (let start = from; start <= latest; start += 2_000n) {
-    const end = start + 1_999n > latest ? latest : start + 1_999n;
+  for (const { start, end } of blockRanges(from, latest, config.logScanBlockRange)) {
     const logs = await client.getContractEvents({ address: config.factoryAddress as `0x${string}`, abi: factoryAbi, eventName: "CPUCreated", fromBlock: start, toBlock: end });
     for (const log of logs) {
       const a = log.args; if (!a.circuits || !a.transistors || !a.creator) continue;

@@ -2,13 +2,13 @@ import type pg from "pg";
 import type { PublicClient } from "viem";
 import type { AppConfig } from "../config.js";
 import { seaportAbi, seaportOrderValidatedAbi } from "../chain/contracts.js";
+import { blockRanges } from "./block-ranges.js";
 
 export async function syncSeaportEvents(pool: pg.Pool, client: PublicClient, config: AppConfig) {
   if (config.seaportIndexStartBlock === null) return 0;
   const checkpoint = await pool.query("SELECT block_number FROM sync_checkpoints WHERE stream='seaport'"); const from = checkpoint.rows[0] ? BigInt(checkpoint.rows[0].block_number) + 1n : config.seaportIndexStartBlock;
   const latest = await client.getBlockNumber() - BigInt(config.confirmations); if (from > latest) return 0; let count = 0;
-  for (let start = from; start <= latest; start += 2_000n) {
-    const end = start + 1_999n > latest ? latest : start + 1_999n;
+  for (const { start, end } of blockRanges(from, latest, config.logScanBlockRange)) {
     const cancelled = await client.getContractEvents({ address: config.seaportAddress as `0x${string}`, abi: seaportAbi, eventName: "OrderCancelled", fromBlock: start, toBlock: end });
     for (const log of cancelled) { if (!log.args.orderHash) continue; await pool.query("UPDATE seaport_listings SET status='CANCELLED',updated_at=now() WHERE order_hash=$1", [log.args.orderHash.toLowerCase()]); count++; }
     const fulfilled = await client.getContractEvents({ address: config.seaportAddress as `0x${string}`, abi: seaportAbi, eventName: "OrderFulfilled", fromBlock: start, toBlock: end });

@@ -34,6 +34,8 @@ Batch quotes are short-lived, deterministic plans for one allowlisted market. Ma
 
 `migrations/0001_initial.sql` creates processors, assets, listings, fills, and resumable checkpoints. The worker scans `CPUCreated` and confirmed Seaport fulfillment/cancellation logs in bounded ranges, writes idempotently, and revalidates active/recoverable listings every configured interval. Run migrations before API/worker rollouts and back up PostgreSQL with scheduled encrypted RDS snapshots or `pg_dump`; rehearse restores.
 
+Set `BSC_LOG_RPC_HTTP_URL` to a dedicated log-capable endpoint and `LOG_SCAN_BLOCK_RANGE=10` when that provider limits `eth_getLogs` to ten blocks per request (for example, an Alchemy free endpoint). Normal API and validation reads still use `BSC_RPC_HTTP_URL` plus `BSC_RPC_FALLBACK_URLS`; only Factory and Seaport event scans use the dedicated endpoint. The default range remains `2000` for providers that support wider ranges. Factory sync, Seaport sync, and listing revalidation are isolated worker jobs, so a provider-specific indexing failure does not block listing revalidation. Worker error output redacts RPC URLs.
+
 Batch summaries read only existing listings, fills, and checkpoints. 24h and indexed volume sum `seller_proceeds_wei`; `buyer_total_wei` is intentionally excluded so the 1% taker fee never inflates trade volume. This capacity/summary release adds no table, column, destructive migration, or rewrite of existing order hashes/signatures.
 
 ## Docker and AWS
